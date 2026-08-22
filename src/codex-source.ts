@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { CodexSession, RolloutLine, SessionMeta } from "./types.ts";
+import type { LineEnding } from "./envelope.ts";
 import { normalizeCwd } from "./paths.ts";
 import { loadDesktopThreads, loadThreadsByIds, reconcileCodexArchive, type DbThreadRow } from "./codex-db.ts";
 import { loadDesktopSelection, projectForCwd } from "./codex-desktop-state.ts";
@@ -47,21 +48,61 @@ function blocksToText(content: unknown): string {
   return parts.join("\n").trim();
 }
 
+/**
+ * Visit a JSONL file one complete line at a time without retaining the file
+ * or its line array in memory. The hash is computed from the exact bytes read,
+ * so callers keep the same change-detection contract as readFileSync().
+ */
+export function forEachUtf8LineSync(
+  filePath: string,
+  visit: (line: string, lineIndex: number, lineEnding: LineEnding) => void,
+): string {
+  const fd = fs.openSync(filePath, "r");
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  let pending = Buffer.alloc(0);
+  let lineIndex = 0;
+
+  try {
+    for (;;) {
+      const bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      const current = chunk.subarray(0, bytesRead);
+      hash.update(current);
+      const data = pending.length === 0 ? current : Buffer.concat([pending, current]);
+      let start = 0;
+
+      for (;;) {
+        const newline = data.indexOf(0x0a, start);
+        if (newline < 0) break;
+        let end = newline;
+        if (end > start && data[end - 1] === 0x0d) end -= 1;
+        const line = decoder.decode(data.subarray(start, end));
+        visit(line, lineIndex++, end < newline ? "\r\n" : "\n");
+        start = newline + 1;
+      }
+
+      pending = start < data.length ? Buffer.from(data.subarray(start)) : Buffer.alloc(0);
+    }
+
+    if (pending.length > 0) {
+      const line = decoder.decode(pending);
+      visit(line, lineIndex++, "");
+    }
+    return hash.digest("hex");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** Parse a single rollout file into a CodexSession (returns null if it has no usable content). */
 export function parseRollout(
   rolloutPath: string,
   opts: ParseOptions = {},
 ): CodexSession | null {
   const useCompaction = opts.useCodexCompaction !== false;
-  let raw: string;
   let sourceContentSha256: string;
-  try {
-    const bytes = fs.readFileSync(rolloutPath);
-    raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-    sourceContentSha256 = createHash("sha256").update(bytes).digest("hex");
-  } catch {
-    return null;
-  }
 
   const meta: SessionMeta = {};
   const items: CodexSession["items"] = [];
@@ -70,61 +111,64 @@ export function parseRollout(
   let model: string | null = null;
   let compactedAway = 0;
 
-  for (const [lineIndex, originalLine] of raw.split(/\r?\n/).entries()) {
-    const line = lineIndex === 0 ? originalLine.replace(/^\uFEFF/, "") : originalLine;
-    if (line.trim() === "") continue;
-    let rec: RolloutLine;
-    try {
-      rec = JSON.parse(line) as RolloutLine;
-    } catch {
-      continue;
-    }
-    const tsMs = tsToMs(rec.timestamp);
-    if (tsMs != null) {
-      if (firstTsMs == null) firstTsMs = tsMs;
-      lastTsMs = tsMs;
-    }
-    const payload = (rec.payload ?? {}) as Record<string, unknown>;
-
-    if (rec.type === "session_meta") {
-      Object.assign(meta, payload as SessionMeta);
-      continue;
-    }
-    if (rec.type === "turn_context") {
-      const m = payload["model"];
-      if (typeof m === "string" && m !== "") model = m;
-      continue;
-    }
-
-    // Codex compacted here: everything before is replaced by the shortened
-    // context it carried forward.
-    if (rec.type === "compacted") {
-      const replacement = payload["replacement_history"];
-      if (useCompaction) {
-        if (!Array.isArray(replacement) || replacement.length === 0) {
-          throw new Error(`compacted rollout has empty or missing replacement history: ${rolloutPath}`);
-        }
-        compactedAway += items.length;
-        items.length = 0;
-        for (const it of replacement) {
-          if (it && typeof it === "object" && !Array.isArray(it)) {
-            items.push({ tsMs, payload: it as Record<string, unknown> });
-          } else {
-            throw new Error(`compacted rollout has a malformed replacement item: ${rolloutPath}`);
-          }
-        }
-      } else {
-        // Keep the history, but record where Codex compacted. Claude has its own
-        // boundary marker and loads only what follows the last one, so the full
-        // transcript stays on disk without being replayed in full.
-        items.push({ tsMs, payload: { type: "__compact_boundary__" } });
+  try {
+    sourceContentSha256 = forEachUtf8LineSync(rolloutPath, (line, lineIndex) => {
+      const jsonLine = lineIndex === 0 ? line.replace(/^\uFEFF/, "") : line;
+      if (jsonLine.trim() === "") return;
+      let rec: RolloutLine;
+      try {
+        rec = JSON.parse(jsonLine) as RolloutLine;
+      } catch {
+        return;
       }
-      continue;
-    }
-    if (rec.type !== "response_item") continue;
+      const tsMs = tsToMs(rec.timestamp);
+      if (tsMs != null) {
+        if (firstTsMs == null) firstTsMs = tsMs;
+        lastTsMs = tsMs;
+      }
+      const payload = (rec.payload ?? {}) as Record<string, unknown>;
 
-    items.push({ tsMs, payload });
+      if (rec.type === "session_meta") {
+        Object.assign(meta, payload as SessionMeta);
+        return;
+      }
+      if (rec.type === "turn_context") {
+        const m = payload["model"];
+        if (typeof m === "string" && m !== "") model = m;
+        return;
+      }
 
+      // Codex compacted here: everything before is replaced by the shortened
+      // context it carried forward.
+      if (rec.type === "compacted") {
+        const replacement = payload["replacement_history"];
+        if (useCompaction) {
+          if (!Array.isArray(replacement) || replacement.length === 0) {
+            throw new Error(`compacted rollout has empty or missing replacement history: ${rolloutPath}`);
+          }
+          compactedAway += items.length;
+          items.length = 0;
+          for (const it of replacement) {
+            if (it && typeof it === "object" && !Array.isArray(it)) {
+              items.push({ tsMs, payload: it as Record<string, unknown> });
+            } else {
+              throw new Error(`compacted rollout has a malformed replacement item: ${rolloutPath}`);
+            }
+          }
+        } else {
+          // Keep the history, but record where Codex compacted. Claude has its own
+          // boundary marker and loads only what follows the last one, so the full
+          // transcript stays on disk without being replayed in full.
+          items.push({ tsMs, payload: { type: "__compact_boundary__" } });
+        }
+        return;
+      }
+      if (rec.type !== "response_item") return;
+
+      items.push({ tsMs, payload });
+    });
+  } catch {
+    return null;
   }
 
   // Derived from the final item list, which compaction may have replaced.

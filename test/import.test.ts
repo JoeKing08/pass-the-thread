@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import {
+  forEachUtf8LineSync,
   parseRollout,
   loadCodexSessions,
   loadDesktopSessions,
@@ -72,6 +73,29 @@ function fixtureSession(): CodexSession {
   assert.equal(files.length, 1);
   return files[0];
 }
+
+test("streaming JSONL reader preserves long lines, BOM, endings, and hash", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-stream-reader-"));
+  const file = path.join(root, "rollout.jsonl");
+  const longText = "x".repeat(1_500_000);
+  const bytes = Buffer.from(
+    `\uFEFF${JSON.stringify({ type: "first", payload: { text: longText } })}\r\n` +
+      `${JSON.stringify({ type: "second", payload: { ok: true } })}\n`,
+    "utf8",
+  );
+  fs.writeFileSync(file, bytes);
+
+  const seen: Array<{ line: string; ending: string }> = [];
+  const hash = forEachUtf8LineSync(file, (line, _index, ending) => {
+    seen.push({ line, ending });
+  });
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].line.charCodeAt(0), 0xfeff);
+  assert.equal(seen[0].line.length, JSON.stringify({ type: "first", payload: { text: longText } }).length + 1);
+  assert.equal(seen[0].ending, "\r\n");
+  assert.equal(seen[1].ending, "\n");
+  assert.equal(hash, sha256File(file));
+});
 
 test("parseRollout extracts meta, cwd, title, messageCount", () => {
   const s = fixtureSession();

@@ -6,10 +6,12 @@ import {
   BRIDGE_IR_VERSION,
   HISTORICAL_SAFETY,
   type BridgeBundle,
+  type BridgeConversation,
   type BridgeEvent,
 } from "./ir.ts";
 import { splitUserMessage } from "./preamble.ts";
 import { decodeCanonicalUtf8 } from "./render-mode.ts";
+import { forEachUtf8LineSync } from "./codex-source.ts";
 import type { CodexSession } from "./types.ts";
 import {
   assertGoalSourceBinding,
@@ -466,6 +468,65 @@ export function codexRolloutToBridgeBundle(
       events: envelopes.flatMap(codexRecordToIr),
     },
   };
+}
+
+/**
+ * Build the bridge sidecar from only Codex's active context. Codex's compact
+ * record already contains the replacement history needed to resume, while
+ * replaying every pre-compact response would recreate the memory spike this
+ * importer is designed to avoid.
+ */
+export function codexRolloutToActiveBridgeBundle(
+  session: CodexSession,
+  goalState: CanonicalGoalSnapshot | null = null,
+): BridgeBundle {
+  const sourceThreadId = session.desktopThreadId ?? session.sessionId;
+  if (goalState != null) {
+    assertGoalSourceBinding(goalState, {
+      provider: "codex",
+      authority: "native-store",
+      sourceThreadId,
+    });
+  }
+
+  const envelopes: RawEnvelope[] = [];
+  const fullSourceContentSha256 = forEachUtf8LineSync(session.rolloutPath, (line, recordIndex, lineEnding) => {
+    const envelope = createEnvelope("codex", line, {
+      sourcePath: session.rolloutPath,
+      recordIndex,
+      lineEnding,
+    });
+    const record = asRecord(envelope.parsed);
+    if (record?.type === "compacted") envelopes.length = 0;
+    envelopes.push(envelope);
+  });
+
+  if (session.sourceContentSha256 != null && session.sourceContentSha256 !== fullSourceContentSha256) {
+    throw new Error(`Codex rollout changed after it was parsed: ${session.rolloutPath}`);
+  }
+  // This sidecar intentionally stores only the active compact snapshot. Its
+  // source hash therefore covers the exact bytes represented by the envelopes,
+  // while the session inventory retains the full-rollout hash for change checks.
+  const sourceContentSha256 = createHash("sha256")
+    .update(envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join(""), "utf8")
+    .digest("hex");
+
+  const conversation: BridgeConversation = {
+    version: BRIDGE_IR_VERSION,
+    id: session.sessionId || deterministicId("codex-conversation-v1", session.rolloutPath),
+    source: "codex-rollout",
+    sourceProvider: "codex",
+    sourcePath: session.rolloutPath,
+    sourceContentSha256,
+    sourceSessionId: session.sessionId || null,
+    sourceThreadId,
+    cwd: session.cwdOriginal || session.cwd || null,
+    title: session.codexName || session.title || null,
+    ...(goalState == null ? {} : { goalState }),
+    recordEnvelopeIds: envelopes.map((envelope) => envelope.id),
+    events: envelopes.flatMap(codexRecordToIr),
+  };
+  return { conversation, envelopes };
 }
 
 /** Join a rollout snapshot to Codex's read-only authoritative Goal store. */

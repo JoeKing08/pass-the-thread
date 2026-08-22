@@ -8,7 +8,11 @@ import path from "node:path";
 import { createEnvelope, sha256Utf8, stableStringify } from "../src/envelope.ts";
 import { readClaudeJsonl, scanClaudeSessions } from "../src/claude-source.ts";
 import { claudeRecordToIr, claudeTranscriptToIr } from "../src/claude-to-ir.ts";
-import { codexRecordToIr, codexRolloutToBridgeBundle } from "../src/codex-to-ir.ts";
+import {
+  codexRecordToIr,
+  codexRolloutToActiveBridgeBundle,
+  codexRolloutToBridgeBundle,
+} from "../src/codex-to-ir.ts";
 import type { CodexSession } from "../src/types.ts";
 import {
   objectPath,
@@ -136,6 +140,45 @@ test("Codex rollouts also get a byte-exact provider-neutral sidecar", () => {
     Buffer.from(restored.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join(""), "utf8"),
     bytes,
   );
+});
+
+test("active Codex sidecar drops pre-compact records without loading them", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-active-sidecar-"));
+  const sourcePath = path.join(root, "rollout.jsonl");
+  const pre = JSON.stringify({
+    type: "response_item",
+    payload: { type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
+  });
+  const compact = JSON.stringify({
+    type: "compacted",
+    payload: {
+      replacement_history: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "summary" }] },
+      ],
+    },
+  });
+  const post = JSON.stringify({
+    type: "response_item",
+    payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "new" }] },
+  });
+  fs.writeFileSync(sourcePath, `${pre}\n${compact}\r\n${post}\n`, "utf8");
+  const session = {
+    sessionId: "codex-active-sidecar", rolloutPath: sourcePath, cwd: "/repo", cwdOriginal: "/repo",
+    meta: {}, firstTsMs: null, lastTsMs: null, items: [], model: null, messageCount: 0,
+    title: "active", source: "cli", isChild: false, userMessageCount: 0,
+  } satisfies CodexSession;
+
+  const bundle = codexRolloutToActiveBridgeBundle(session);
+  assert.deepEqual(
+    bundle.envelopes.map((envelope) => envelope.raw),
+    [compact, post],
+  );
+  assert.deepEqual(
+    bundle.envelopes.map((envelope) => envelope.lineEnding),
+    ["\r\n", "\n"],
+  );
+  assert.ok(bundle.conversation.events.some((event) => event.kind === "compact_boundary"));
+  assert.ok(bundle.conversation.events.some((event) => event.kind === "text" && event.text === "new"));
 });
 
 test("every Codex envelope maps to typed historical IR or an explicit unknown", () => {

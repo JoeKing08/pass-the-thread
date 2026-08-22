@@ -49,10 +49,17 @@ import type { TargetState, TranscriptLocation } from "./claude-target.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
 import { parseRenderMode } from "./render-mode.ts";
-import { codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
+import {
+  codexRolloutToActiveBridgeBundle,
+  codexRolloutToBridgeBundle,
+} from "./codex-to-ir.ts";
 import { defaultBridgeRoot, writeBridgeConversation } from "./bridge-store.ts";
 import type { ClaudeTranscriptRecord, SessionFilter } from "./types.ts";
-import { parseGoalMigrationMode, type GoalMigrationMode } from "./goal.ts";
+import {
+  parseGoalMigrationMode,
+  readCodexGoalSnapshot,
+  type GoalMigrationMode,
+} from "./goal.ts";
 import {
   applyClaudeGoalTarget,
   claudeGoalHistoryIdentity,
@@ -445,8 +452,10 @@ export function main(argv: string[]): number {
         process.stdout.write(`skip  ${s.sessionId}  (source rollout changed after inventory; run again)\n`);
         continue;
       }
-      const bundle = codexRolloutWithGoalToBridgeBundle(s, codexHome);
-      const sourceGoal = bundle.conversation.goalState;
+      // The ordinary Claude import only needs the authoritative Goal snapshot.
+      // Building the full provider-neutral IR here rereads and materializes the
+      // entire rollout, which defeats the streaming Codex parser for large files.
+      const sourceGoal = readCodexGoalSnapshot(codexHome, s.desktopThreadId ?? s.sessionId);
       const goalIdentity = claudeGoalHistoryIdentity(sourceGoal, goalMode);
       if (!force && alreadyImported(history, sha, renderMode, goalIdentity)) {
         skipped += 1;
@@ -713,7 +722,10 @@ export function main(argv: string[]): number {
         imported += 1;
         continue;
       }
-      writeBridgeConversation(bridgeRoot, bundle);
+      const bridgeBundle = values["full-history"] === true
+        ? codexRolloutToBridgeBundle(s, sourceGoal)
+        : codexRolloutToActiveBridgeBundle(s, sourceGoal);
+      writeBridgeConversation(bridgeRoot, bridgeBundle);
       const res = writeTranscript(claudeHome, s, linesToWrite);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a
