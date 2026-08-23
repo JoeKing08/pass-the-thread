@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createEnvelope, sha256Utf8, stableStringify } from "../src/envelope.ts";
-import { readClaudeJsonl, scanClaudeSessions } from "../src/claude-source.ts";
+import { forEachClaudeUtf8LineSync, readClaudeJsonl, scanClaudeSessions } from "../src/claude-source.ts";
 import { claudeRecordToIr, claudeTranscriptToIr } from "../src/claude-to-ir.ts";
 import {
   codexRecordToIr,
@@ -80,6 +80,55 @@ test("Claude JSONL reading never drops malformed records or line endings", () =>
   fs.copyFileSync(file, path.join(project, "s1.jsonl"));
   fs.writeFileSync(path.join(project, "ignore.txt"), "not a transcript");
   assert.deepEqual(scanClaudeSessions(home).map((item) => path.basename(item.sourcePath)), ["s1.jsonl"]);
+});
+
+test("Claude JSONL streaming mode keeps metadata without retaining envelopes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-streaming-"));
+  const sourcePath = path.join(root, "session.jsonl");
+  const contents = [
+    JSON.stringify({ type: "assistant", sessionId: "streamed", cwd: "/repo", message: { content: "meta" } }),
+    JSON.stringify({ type: "user", sessionId: "streamed", cwd: "/repo", message: { content: "request" } }),
+  ].join("\n") + "\n";
+  fs.writeFileSync(sourcePath, contents, "utf8");
+
+  const visited: string[] = [];
+  const digest = forEachClaudeUtf8LineSync(sourcePath, (line, index, ending) => {
+    visited.push(`${index}:${line}:${ending}`);
+  });
+  assert.deepEqual(visited, [
+    `0:${contents.split("\n")[0]}:\n`,
+    `1:${contents.split("\n")[1]}:\n`,
+  ]);
+  assert.equal(digest, createHash("sha256").update(contents, "utf8").digest("hex"));
+
+  const source = readClaudeJsonl(sourcePath, { retainRecords: false });
+  assert.deepEqual(source.records, []);
+  assert.equal(source.sessionId, "streamed");
+  assert.deepEqual(source.sessionIds, ["streamed"]);
+  assert.equal(source.cwd, "/repo");
+  assert.deepEqual(source.cwds, ["/repo"]);
+  assert.equal(source.title, "request");
+  assert.equal(source.contentSha256, digest);
+
+  const home = path.join(root, ".claude");
+  const project = path.join(home, "projects", "-repo");
+  fs.mkdirSync(project, { recursive: true });
+  fs.copyFileSync(sourcePath, path.join(project, "streamed.jsonl"));
+  const scanned = scanClaudeSessions(home);
+  assert.equal(scanned.length, 1);
+  assert.deepEqual(scanned[0]?.records, []);
+});
+
+test("Claude streaming reader handles UTF-8 split at a chunk boundary", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-stream-boundary-"));
+  const sourcePath = path.join(root, "boundary.jsonl");
+  const prefix = "x".repeat(1024 * 1024 - 1);
+  const contents = `${prefix}€\n${JSON.stringify({ type: "user", sessionId: "boundary", message: { content: "ok" } })}\n`;
+  fs.writeFileSync(sourcePath, contents, "utf8");
+  const lines: string[] = [];
+  forEachClaudeUtf8LineSync(sourcePath, (line) => lines.push(line));
+  assert.equal(lines[0], `${prefix}€`);
+  assert.equal(JSON.parse(lines[1]!).sessionId, "boundary");
 });
 
 test("invalid UTF-8 is refused instead of being normalized", () => {

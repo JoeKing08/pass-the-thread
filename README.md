@@ -224,7 +224,10 @@ This writes into another application's local data, so it stays cautious.
 - Codex encrypts its compaction summaries, so an import shows where compaction
   happened but not what it said.
 - Sub-agent threads arrive as messages, not as separate threads.
-- Large rollouts are read whole. No streaming yet.
+- JSONL sources are read incrementally with strict UTF-8 validation and
+  byte-exact hashing. A selected conversion still builds its typed sidecar in
+  memory, while bulk Claude inventory scans release transcript envelopes as
+  they go.
 
 ## Documentation
 
