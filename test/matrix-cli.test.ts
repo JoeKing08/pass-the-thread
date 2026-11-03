@@ -76,7 +76,7 @@ test("an empty normalized plan selector remains unconstrained during apply", () 
 });
 
 test("the confirmed matrix digest binds render mode and target identity", () => {
-  const base: Omit<Extract<MatrixPlanFile, { direction: "claude-to-codex" }>, "digest"> = {
+  const base: Omit<Extract<MatrixPlanFile, { schema: "agentryx.import-plan/v4"; direction: "claude-to-codex" }>, "digest"> = {
     schema: "agentryx.import-plan/v4",
     direction: "claude-to-codex",
     renderMode: "semantic",
@@ -828,6 +828,7 @@ test("Claude wrapper identity must agree with every transcript identity", () => 
   const transcript = {
     sourcePath: "cli-1.jsonl", contentSha256: "a".repeat(64), records: [],
     sessionId: "cli-1", sessionIds: ["cli-1"], cwd: "c:\\repo", cwds: ["c:\\repo"], title: null,
+    firstTsMs: null, lastTsMs: null,
   } satisfies ClaudeSourceTranscript;
   assert.equal(transcriptIdentityError(desktop, transcript), null);
   assert.match(transcriptIdentityError(desktop, { ...transcript, sessionIds: ["cli-1", "other"] }) ?? "", /session id/);
@@ -1007,7 +1008,8 @@ test("Claude compact boundary plus following summary becomes nonempty resumable 
   fs.writeFileSync(transcriptPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
   const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
   const logical = bridgeToLogical({
-    desktop: {
+    session: {
+      sourceKind: "claude-desktop",
       wrapperPath: path.join(root, "wrapper.json"), wrapperSessionId: sessionId,
       cliSessionId: sessionId, sessionId, cwd: cwdVariant, title: "compact", isArchived: false,
       createdAtMs: Date.parse("2026-07-26T00:00:00.000Z"), lastActivityAtMs: Date.parse("2026-07-26T00:00:01.000Z"),
@@ -1040,7 +1042,8 @@ test("semantic reverse rendering keeps the latest compact summary and appends po
   fs.writeFileSync(transcriptPath, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
   const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
   const logical = bridgeToLogical({
-    desktop: {
+    session: {
+      sourceKind: "claude-desktop",
       wrapperPath: path.join(root, "local_wrapper.json"), wrapperSessionId: "local_wrapper",
       cliSessionId: sessionId, sessionId: "local_wrapper", cwd: root, title: "compact", isArchived: false,
       createdAtMs: null, lastActivityAtMs: null, transcriptPath, transcriptExists: true, transcriptStatus: "available",
@@ -1073,7 +1076,8 @@ test("Claude compact boundary without a summary fails closed instead of writing 
   ].join("\n") + "\n", "utf8");
   const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
   assert.throws(() => bridgeToLogical({
-    desktop: {
+    session: {
+      sourceKind: "claude-desktop",
       wrapperPath: path.join(root, "wrapper.json"), wrapperSessionId: sessionId,
       cliSessionId: sessionId, sessionId, cwd: root, title: "compact", isArchived: false,
       createdAtMs: null, lastActivityAtMs: null, transcriptPath, transcriptExists: true,
@@ -1095,7 +1099,8 @@ test("verbatim reverse rendering preserves compact source as inert history witho
   fs.writeFileSync(transcriptPath, raw, "utf8");
   const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
   const logical = bridgeToLogical({
-    desktop: {
+    session: {
+      sourceKind: "claude-desktop",
       wrapperPath: path.join(root, "wrapper.json"), wrapperSessionId: sessionId,
       cliSessionId: sessionId, sessionId, cwd: root, title: "compact", isArchived: false,
       createdAtMs: null, lastActivityAtMs: null, transcriptPath, transcriptExists: true,
@@ -1115,7 +1120,8 @@ test("verbatim reverse rendering preserves compact source as inert history witho
   })}\n`, "utf8");
   const oversizedBundle = claudeTranscriptToIr(readClaudeJsonl(oversizedPath));
   const oversized = bridgeToLogical({
-    desktop: {
+    session: {
+      sourceKind: "claude-desktop",
       wrapperPath: path.join(root, "oversized-wrapper.json"), wrapperSessionId: sessionId,
       cliSessionId: sessionId, sessionId, cwd: root, title: "oversized", isArchived: false,
       createdAtMs: null, lastActivityAtMs: null, transcriptPath: oversizedPath,

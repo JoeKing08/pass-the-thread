@@ -72,8 +72,8 @@ and marks the body untrusted — see [CLI](docs/CLI.md#session-handoff).
 The original Codex → Claude commands remain available. The provider matrix adds the first reverse adapter through the same `threadpass` entrypoint:
 
 ```text
-Codex  ── shared typed IR + transactional adapter ──► Claude
-Claude ── shared typed IR + 41059 adapter ──────────► Codex
+Codex  ── shared typed IR + transactional adapter ───────────────► Claude
+Claude Desktop / Claude Code ── shared typed IR + 41059 adapter ─► Codex
 ```
 
 Start with a read-only inventory or a saved deterministic plan:
@@ -86,9 +86,33 @@ threadpass plan --archive active --project-scope existing-targets \
   --out import-plan.json
 ```
 
+Claude Code can be selected as a native transcript source, without requiring
+Claude Desktop's session wrappers:
+
+```bash
+threadpass scan --claude-source code --claude-home ~/.claude --archive all
+threadpass plan --claude-source code --claude-home ~/.claude --archive all \
+  --render-mode semantic \
+  --evidence reference/codex-desktop/26.721.41059/manifest.json \
+  --out import-plan.json
+```
+
+Claude Code transcripts do not contain Desktop's wrapper archive flag. Their
+archive state is therefore reported as unknown, so reverse plans require
+`--archive all`; the new Codex target is written active. Agent/subagent JSONL
+sidecars are excluded, session IDs must match their transcript filename, and
+the source kind is bound into the v5 plan digest. Existing Claude Desktop v4
+plans remain supported.
+
 There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, inclusive date bounds, and an explicit `--limit`. `existing-targets` means the canonical target project/group/root already exists; it does not mean that the exact target conversation exists. Plans report those facts separately as `targetProjectExists` and `targetConversationExists` (plus an exact/collision state). Unknown project membership, archive state, or activity time stays visible in an `all`/unfiltered inventory and fails closed if a requested filter needs it. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/access records and superseded Goal events always remain inert. A separately identified authoritative active Goal is restored by default in either render mode; `--goal-mode skip` keeps it as history without live activation.
 
 Applying a reverse plan is intentionally strict and Windows-only for this first target. It requires Codex Desktop to be closed, the exact saved plan digest, and the pinned [26.721.41059 evidence manifest](reference/codex-desktop/26.721.41059/manifest.json). The loader re-hashes the installed `app.asar` and `codex.exe`; a copied manifest by itself is not accepted as live-version evidence. Apply probes once under the lock, performs Goal/journal/sidecar setup, then full-hashes the active Appx identity again immediately before the first Codex target mutation. A mismatch fails closed. That second probe is the exact batch-start support snapshot; updates during the subsequent multi-session batch are outside atomicity, so artifacts are not re-hashed per session. Unknown/new builds can still be scanned and planned, but receive no private-write capability. Research or dry-run planning for another installed build requires a user-supplied provenance manifest that binds those live artifacts; that manifest does not itself enable writes. The plan independently binds rollout, thread-index, archive, project-identity, and Goal capabilities. `apply --dry-run` writes nothing, reports static blockers, and names live gates it cannot prove without applying. See [CLI](docs/CLI.md#experimental-bidirectional-matrix).
+
+On Linux, `--codex-target cli` is a separate experimental target. It writes a
+new rollout file only and binds the detected Codex CLI version and binary hash
+plus the configured model provider. It never mutates Desktop SQLite state.
+Existing identical rollouts are idempotent; collisions are refused. It does
+not activate live Goals and imports as an active session.
 
 Semantic Claude history is only made resumable when its compact summary can be
 recovered into a nonempty Codex `replacement_history`; otherwise planning fails
@@ -186,13 +210,16 @@ Recents, and plenty of people never look at them, so membership is a filter:
 
 ## Requirements
 
-Windows or macOS, and Node.js 22.6 or newer. The runtime has no production dependencies; development installs TypeScript and Node declarations for strict type checking.
+Node.js 22.6 or newer. The Codex Desktop target requires Windows. The
+file-only Codex CLI target is Linux-only and experimental. The runtime has no
+production dependencies; development installs TypeScript and Node declarations
+for strict type checking.
 
 Every path resolves per platform: the Claude Desktop session-record store from
 `%APPDATA%`, `~/Library/Application Support` or `$XDG_CONFIG_HOME`, and
-`~/.codex` and `~/.claude` from the home directory. Linux follows the same rules
-but has not been run there; `--sessions-root` and `--claude-home` override any
-of it.
+`~/.codex` and `~/.claude` from the home directory. Claude Code source and the
+Codex CLI target are covered by Linux tests; `--sessions-root` and
+`--claude-home` override source paths.
 
 ## Safety
 

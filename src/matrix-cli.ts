@@ -10,6 +10,20 @@ import {
   resolveClaudeDesktopWorkspace,
   type ClaudeDesktopSourceSession,
 } from "./claude-desktop-source.ts";
+import {
+  claudeCodeTranscriptIdentityError,
+  inventoryClaudeCode,
+  type ClaudeCodeSourceSession,
+} from "./claude-code-source.ts";
+import {
+  applyCodexCliTarget,
+  CODEX_CLI_RENDERER_ID,
+  detectCodexCliRuntime,
+  inspectCodexCliTarget,
+  planCodexCliTarget,
+  type CodexCliRuntime,
+  type CodexCliTargetPlan,
+} from "./codex-cli-target.ts";
 import { readClaudeJsonl } from "./claude-source.ts";
 import { claudeTranscriptToIr } from "./claude-to-ir.ts";
 import type { BridgeBundle, BridgeEvent } from "./ir.ts";
@@ -120,7 +134,7 @@ import {
 } from "./goal.ts";
 
 export interface MatrixTargetSessionPlan {
-  sourceWrapperSessionId: string;
+  sourceWrapperSessionId: string | null;
   sourceCliSessionId: string;
   operationId: string;
   targetThreadId: string;
@@ -172,7 +186,7 @@ export interface MatrixTargetBinding {
   sessions: MatrixTargetSessionPlan[];
 }
 
-export interface MatrixReversePlanFile {
+export interface MatrixReversePlanFileV4 {
   schema: "agentryx.import-plan/v4";
   direction: "claude-to-codex";
   renderMode: RenderMode;
@@ -184,6 +198,54 @@ export interface MatrixReversePlanFile {
   plan: ImportPlan;
   target: MatrixTargetBinding;
 }
+
+export interface MatrixReversePlanFileV5 extends Omit<MatrixReversePlanFileV4, "schema"> {
+  schema: "agentryx.import-plan/v5";
+  sourceKind: "claude-code";
+}
+
+export interface MatrixCliTargetSessionPlan {
+  sourceSessionId: string;
+  operationId: string;
+  targetThreadId: string;
+  rolloutPath: string;
+  rolloutSha256: string;
+  rolloutBytes: number;
+}
+
+export interface MatrixCliTargetBinding {
+  codexHome: string;
+  claudeHome: string;
+  bridgeRoot: string;
+  cliVersion: string;
+  modelProvider: string;
+  cliExecutablePath: string;
+  cliExecutableSha256: string;
+  rendererId: typeof CODEX_CLI_RENDERER_ID;
+  sessions: MatrixCliTargetSessionPlan[];
+}
+
+export interface MatrixCliTargetPlanFile {
+  schema: "agentryx.import-plan/v6";
+  direction: "claude-to-codex";
+  sourceKind: ClaudeSourceKind;
+  targetKind: "codex-cli";
+  renderMode: RenderMode;
+  goalMode: "skip";
+  titlePolicy: TitleTransformPolicy | null;
+  activeContextPolicy: ActiveContextPolicy | null;
+  allowWrapperCwdRelocation: boolean;
+  digest: string;
+  plan: ImportPlan;
+  target: MatrixCliTargetBinding;
+}
+
+export type MatrixReversePlanFile = MatrixReversePlanFileV4 | MatrixReversePlanFileV5;
+
+export type ClaudeSourceKind = "claude-desktop" | "claude-code";
+export type ClaudeImportSession =
+  | (ClaudeDesktopSourceSession & { sourceKind: "claude-desktop" })
+  | ClaudeCodeSourceSession;
 
 export interface TitleTransformPolicy {
   prefix: string;
@@ -247,11 +309,12 @@ export interface MatrixForwardPlanFile {
   target: MatrixForwardTargetBinding;
 }
 
-export type MatrixPlanFile = MatrixReversePlanFile | MatrixForwardPlanFile;
+export type MatrixPlanFile = MatrixReversePlanFile | MatrixCliTargetPlanFile | MatrixForwardPlanFile;
 export type MatrixDirection = MatrixPlanFile["direction"];
+export type CodexTargetKind = "codex-desktop" | "codex-cli";
 
 export interface LoadedSource {
-  desktop: ClaudeDesktopSourceSession;
+  session: ClaudeImportSession;
   bundle: BridgeBundle | null;
   summary: ImportPlanSessionSummary;
 }
@@ -542,6 +605,20 @@ export function matrixDirection(argv: string[]): MatrixDirection {
   return value;
 }
 
+export function claudeSourceKindOption(argv: string[]): ClaudeSourceKind {
+  const value = option(argv, "--claude-source");
+  if (value == null || value === "desktop") return "claude-desktop";
+  if (value === "code") return "claude-code";
+  throw new Error("--claude-source must be desktop or code");
+}
+
+export function codexTargetKindOption(argv: string[]): CodexTargetKind {
+  const value = option(argv, "--codex-target");
+  if (value == null || value === "desktop") return "codex-desktop";
+  if (value === "cli") return "codex-cli";
+  throw new Error("--codex-target must be desktop or cli");
+}
+
 export function titleTransformPolicyOption(argv: string[]): TitleTransformPolicy | null {
   const prefixes = optionValues(argv, "--title-prefix");
   if (new Set(prefixes).size > 1) throw new Error("conflicting --title-prefix values");
@@ -793,30 +870,67 @@ export function nativeToolUseIds(events: BridgeEvent[]): Set<string> {
 
 function loadSources(
   argv: string[], selection: SelectionOptions, allowWrapperCwdRelocation = false,
-): { sources: LoadedSource[]; workspaceDir: string; unreadable: string[]; inventory: ClaudeDesktopSourceSession[] } {
+  sourceKind: ClaudeSourceKind = "claude-desktop",
+  targetKind: CodexTargetKind = "codex-desktop",
+): {
+  sources: LoadedSource[];
+  sourceRoot: string;
+  sourceKind: ClaudeSourceKind;
+  unreadable: string[];
+  inventory: ClaudeImportSession[];
+} {
+  if (targetKind === "codex-cli" && selection.projectScope === "existing-targets") {
+    throw new Error("--project-scope existing-targets applies only to Codex Desktop targets");
+  }
   const claudeHome = resolveClaudeHome(option(argv, "--claude-home"));
   const codexHome = resolveCodexHome(option(argv, "--codex-home"));
   const sessionsRoot = option(argv, "--sessions-root");
-  const workspaceDir = option(argv, "--workspace-dir") ??
-    resolveClaudeDesktopWorkspace(claudeHome, sessionsRoot);
-  const inventory = inventoryClaudeDesktop(claudeHome, workspaceDir);
-  const targets = new Map(inventory.sessions.map((desktop) => [desktop.sessionId, targetProject(codexHome, desktop.cwd)]));
-  const selectionSessions: SelectionSession[] = inventory.sessions.map((desktop) => {
-    const target = targets.get(desktop.sessionId)!;
+  let sourceRoot: string;
+  let unreadable: string[];
+  let inventory: ClaudeImportSession[];
+  if (sourceKind === "claude-code") {
+    if (option(argv, "--workspace-dir") != null) {
+      throw new Error("--workspace-dir applies only to Claude Desktop sources");
+    }
+    if (allowWrapperCwdRelocation) {
+      throw new Error("--allow-wrapper-cwd-relocation applies only to Claude Desktop sources");
+    }
+    const codeInventory = inventoryClaudeCode(claudeHome);
+    sourceRoot = codeInventory.sourceRoot;
+    unreadable = codeInventory.unreadableRecords;
+    inventory = codeInventory.sessions;
+  } else {
+    const workspaceDir = option(argv, "--workspace-dir") ??
+      resolveClaudeDesktopWorkspace(claudeHome, sessionsRoot);
+    const desktopInventory = inventoryClaudeDesktop(claudeHome, workspaceDir);
+    sourceRoot = workspaceDir;
+    unreadable = desktopInventory.unreadableRecords;
+    inventory = desktopInventory.sessions.map((session) => ({ ...session, sourceKind: "claude-desktop" }));
+  }
+  const targets = new Map(inventory.map((session) => [
+    session.sessionId,
+    targetKind === "codex-cli"
+      ? { exists: null, provenance: "codex-cli-has-no-project-registry" }
+      : targetProject(codexHome, session.cwd),
+  ]));
+  const selectionSessions: SelectionSession[] = inventory.map((session) => {
+    const target = targets.get(session.sessionId)!;
     return {
-      sessionId: desktop.sessionId,
-      cwd: desktop.cwd,
-      projectRoot: desktop.cwd,
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      projectRoot: session.cwd,
       projectName: target.name,
-      hasProject: desktop.cwd !== "",
-      isArchived: desktop.isArchived,
-      archiveState: desktop.archiveState,
-      archiveProvenance: desktop.archiveProvenance,
-      projectMembership: desktop.cwd === "" ? "projectless" : "project",
-      projectMembershipProvenance: "claude-wrapper-cwd",
+      hasProject: session.cwd !== "",
+      ...(session.sourceKind === "claude-desktop" && session.isArchived != null
+        ? { isArchived: session.isArchived } : {}),
+      archiveState: session.archiveState,
+      archiveProvenance: session.archiveProvenance,
+      projectMembership: session.cwd === "" ? "projectless" : "project",
+      projectMembershipProvenance: session.sourceKind === "claude-code"
+        ? "claude-code-transcript-cwd" : "claude-wrapper-cwd",
       targetProjectExists: target.exists,
-      firstTsMs: desktop.createdAtMs,
-      lastTsMs: desktop.lastActivityAtMs,
+      firstTsMs: session.createdAtMs,
+      lastTsMs: session.lastActivityAtMs,
     };
   });
   // Checked once, against the whole freshly loaded inventory, before selection
@@ -824,59 +938,62 @@ function loadSources(
   // means the request was not honored, not that it selected fewer sessions.
   assertSelectorsResolve(selectionSessions, selection);
   const selectedIds = new Set(selectSessions(selectionSessions, selection).map((session) => session.sessionId));
-  const sources: LoadedSource[] = inventory.sessions.filter((desktop) => selectedIds.has(desktop.sessionId)).map((desktop) => {
-    const target = targets.get(desktop.sessionId)!;
-    if (!desktop.transcriptExists || desktop.transcriptPath == null) {
+  const sources: LoadedSource[] = inventory.filter((session) => selectedIds.has(session.sessionId)).map((session) => {
+    const target = targets.get(session.sessionId)!;
+    const transcriptPath = session.transcriptPath;
+    const commonSummary = {
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      projectRoot: session.cwd,
+      projectName: target.name,
+      hasProject: session.cwd !== "",
+      ...(session.sourceKind === "claude-desktop" && session.isArchived != null
+        ? { isArchived: session.isArchived } : {}),
+      archiveState: session.archiveState,
+      archiveProvenance: session.archiveProvenance,
+      projectMembership: session.cwd === "" ? "projectless" as const : "project" as const,
+      projectMembershipProvenance: session.sourceKind === "claude-code"
+        ? "claude-code-transcript-cwd" : "claude-wrapper-cwd",
+      targetProjectExists: target.exists,
+      firstTsMs: session.createdAtMs,
+      lastTsMs: session.lastActivityAtMs,
+      ...(transcriptPath == null ? {} : { sourcePath: transcriptPath }),
+    };
+    if (!session.transcriptExists || transcriptPath == null) {
       return {
-        desktop,
+        session,
         bundle: null,
         summary: {
-          sessionId: desktop.sessionId, cwd: desktop.cwd, projectRoot: desktop.cwd,
-          projectName: target.name, hasProject: desktop.cwd !== "", isArchived: desktop.isArchived,
-          archiveState: desktop.archiveState, archiveProvenance: desktop.archiveProvenance,
-          projectMembership: desktop.cwd === "" ? "projectless" : "project",
-          projectMembershipProvenance: "claude-wrapper-cwd",
-          targetProjectExists: target.exists,
-          firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
-          sourcePath: desktop.transcriptPath ?? undefined, title: desktop.title,
-          losses: [{ kind: `transcript_${desktop.transcriptStatus}`, count: 1 }],
+          ...commonSummary,
+          title: session.title,
+          losses: [{ kind: `transcript_${session.transcriptStatus}`, count: 1 }],
         },
       };
     }
-    const transcript = readClaudeJsonl(desktop.transcriptPath);
-    const identityError = transcriptIdentityError(desktop, transcript);
+    const transcript = readClaudeJsonl(transcriptPath);
+    const identityError = session.sourceKind === "claude-code"
+      ? claudeCodeTranscriptIdentityError(session, transcript)
+      : transcriptIdentityError(session, transcript);
     if (identityError != null && !wrapperCwdRelocationAllowed(identityError, allowWrapperCwdRelocation)) {
       return {
-        desktop,
+        session,
         bundle: null,
         summary: {
-          sessionId: desktop.sessionId, cwd: desktop.cwd, projectRoot: desktop.cwd,
-          projectName: target.name, hasProject: desktop.cwd !== "", isArchived: desktop.isArchived,
-          archiveState: desktop.archiveState, archiveProvenance: desktop.archiveProvenance,
-          projectMembership: desktop.cwd === "" ? "projectless" : "project",
-          projectMembershipProvenance: "claude-wrapper-cwd",
-          targetProjectExists: target.exists,
-          firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
-          sourcePath: desktop.transcriptPath, sourceSha256: transcript.contentSha256,
-          title: desktop.title || transcript.title || undefined,
+          ...commonSummary,
+          sourceSha256: transcript.contentSha256,
+          title: session.title || transcript.title || undefined,
           losses: [{ kind: "transcript_identity_mismatch", count: 1, detail: identityError }],
         },
       };
     }
     const bundle = claudeTranscriptToIr(transcript);
     return {
-      desktop,
+      session,
       bundle,
       summary: {
-        sessionId: desktop.sessionId, cwd: desktop.cwd, projectRoot: desktop.cwd,
-        projectName: target.name, hasProject: desktop.cwd !== "", isArchived: desktop.isArchived,
-        archiveState: desktop.archiveState, archiveProvenance: desktop.archiveProvenance,
-        projectMembership: desktop.cwd === "" ? "projectless" : "project",
-        projectMembershipProvenance: "claude-wrapper-cwd",
-        targetProjectExists: target.exists,
-        firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
-        sourcePath: desktop.transcriptPath, sourceSha256: transcript.contentSha256,
-        title: desktop.title || transcript.title || undefined,
+        ...commonSummary,
+        sourceSha256: transcript.contentSha256,
+        title: session.title || transcript.title || undefined,
         messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
         losses: [
           ...lossObservations(bundle.conversation.events),
@@ -889,7 +1006,7 @@ function loadSources(
       },
     };
   });
-  return { sources, workspaceDir, unreadable: inventory.unreadableRecords, inventory: inventory.sessions };
+  return { sources, sourceRoot, sourceKind, unreadable, inventory };
 }
 
 function compactNumbers(value: unknown): { preTokens?: number; postTokens?: number } {
@@ -932,7 +1049,7 @@ function inertToolText(label: string, value: unknown): string {
 }
 
 function exactSourceText(source: LoadedSource): string {
-  if (!source.bundle) throw new Error(`source transcript is missing for ${source.desktop.sessionId}`);
+  if (!source.bundle) throw new Error(`source transcript is missing for ${source.session.sessionId}`);
   return source.bundle.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join("");
 }
 
@@ -941,17 +1058,17 @@ export function bridgeToLogical(
   renderMode: RenderMode,
   titlePolicy: TitleTransformPolicy | null = null,
 ): Omit<LogicalCodexConversation, "threadId"> {
-  if (!source.bundle) throw new Error(`source transcript is missing for ${source.desktop.sessionId}`);
+  if (!source.bundle) throw new Error(`source transcript is missing for ${source.session.sessionId}`);
   if (renderMode === "verbatim") {
-    const createdAtMs = source.desktop.createdAtMs;
+    const createdAtMs = source.session.createdAtMs;
     const createdAt = createdAtMs != null && Number.isFinite(createdAtMs)
       ? new Date(createdAtMs).toISOString()
       : new Date(0).toISOString();
     const literal = `${inertHistoricalNotice("Claude JSONL")}\n\n${exactSourceText(source)}`;
     const logical = {
-      cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
+      cwd: canonicalProjectIdentity(source.session.cwd || os.homedir()).path,
       title: transformTitle(
-        source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
+        source.session.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
         titlePolicy,
       ),
       createdAt,
@@ -1057,7 +1174,7 @@ export function bridgeToLogical(
   }
   if (compaction != null && (compaction.summary == null || compaction.summary.trim() === "")) {
     throw new Error(
-      `Claude compact boundary has no recoverable replacement summary: ${source.desktop.sessionId}`,
+      `Claude compact boundary has no recoverable replacement summary: ${source.session.sessionId}`,
     );
   }
   let earliest = Number.POSITIVE_INFINITY;
@@ -1066,11 +1183,11 @@ export function bridgeToLogical(
     const parsed = Date.parse(event.timestamp);
     if (Number.isFinite(parsed) && parsed < earliest) earliest = parsed;
   }
-  const createdAt = new Date(source.desktop.createdAtMs ?? earliest);
+  const createdAt = new Date(source.session.createdAtMs ?? earliest);
   const logical = {
-    cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
+    cwd: canonicalProjectIdentity(source.session.cwd || os.homedir()).path,
     title: transformTitle(
-      source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation",
+      source.session.title || source.bundle.conversation.title || "Imported Claude conversation",
       titlePolicy,
     ),
     createdAt: Number.isNaN(createdAt.getTime()) ? new Date(0).toISOString() : createdAt.toISOString(),
@@ -1124,7 +1241,9 @@ export function compactLogicalForTarget(
 }
 
 export function matrixPlanDigest(
-  value: Omit<MatrixReversePlanFile, "digest"> | Omit<MatrixForwardPlanFile, "digest">,
+  value: Omit<MatrixReversePlanFile, "digest"> |
+    Omit<MatrixCliTargetPlanFile, "digest"> |
+    Omit<MatrixForwardPlanFile, "digest">,
 ): string {
   assertCurrentImportPlan(value.plan);
   return createHash("sha256").update(canonicalStringify(value), "utf8").digest("hex");
@@ -1488,8 +1607,8 @@ export function buildForwardMatrixPlan(
 
 function targetSummary(source: LoadedSource, plan: CodexTargetPlan): MatrixTargetSessionPlan {
   return {
-    sourceWrapperSessionId: source.desktop.wrapperSessionId,
-    sourceCliSessionId: source.desktop.cliSessionId!,
+    sourceWrapperSessionId: source.session.wrapperSessionId,
+    sourceCliSessionId: source.session.cliSessionId!,
     operationId: plan.operationId,
     targetThreadId: plan.threadId,
     rolloutPath: canonicalExistingPath(plan.rolloutPath),
@@ -1682,12 +1801,13 @@ function buildMatrixPlan(
   titlePolicy: TitleTransformPolicy | null,
   activeContextPolicy: ActiveContextPolicy | null,
   allowWrapperCwdRelocation: boolean,
+  sourceKind: ClaudeSourceKind,
   codexHome: string, dbPath: string, bridgeRoot: string, evidence: CodexTargetEvidence,
 ): { file: MatrixReversePlanFile; targetPlans: CodexTargetPlan[] } {
   const logicalById = new Map(sources.map((source) => {
-    if (!source.bundle) return [source.desktop.sessionId, null] as const;
+    if (!source.bundle) return [source.session.sessionId, null] as const;
     return [
-      source.desktop.sessionId,
+      source.session.sessionId,
       compactLogicalForTarget(bridgeToLogical(source, renderMode, titlePolicy), activeContextPolicy),
     ] as const;
   }));
@@ -1705,16 +1825,17 @@ function buildMatrixPlan(
   });
   const built = buildImportPlan(summaries, { selection });
   const privateWriteProfile = probeCodexPrivateWriteProfile(evidence);
-  const byId = new Map(sources.map((source) => [source.desktop.sessionId, source]));
+  const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
   const targetPlans = built.plan.sessions.map((selected) => {
     const source = byId.get(selected.sessionId);
     if (!source?.bundle || !selected.sourceSha256) throw new Error(`source is unavailable: ${selected.sessionId}`);
-    if (selected.archiveState === "unknown") {
+    if (selected.archiveState === "unknown" && sourceKind !== "claude-code") {
       throw new Error(`target archive state is unknown for ${selected.sessionId}`);
     }
     return planCodexTarget(
       codexHome, dbPath, `${selected.sessionId}\0render:${renderMode}`, selected.sourceSha256,
-      logicalById.get(selected.sessionId)!.conversation, selected.archiveState === "archived",
+      logicalById.get(selected.sessionId)!.conversation,
+      sourceKind === "claude-code" ? false : selected.archiveState === "archived",
       source.bundle.conversation.goalState ?? null, goalMode,
     );
   });
@@ -1724,9 +1845,8 @@ function buildMatrixPlan(
     built.plan.sessions[index]!.targetConversationState = state === "already-applied"
       ? "exact-existing" : state;
   }
-  const withoutDigest: Omit<MatrixReversePlanFile, "digest"> = {
-    schema: "agentryx.import-plan/v4",
-    direction: "claude-to-codex",
+  const common = {
+    direction: "claude-to-codex" as const,
     renderMode,
     goalMode,
     titlePolicy,
@@ -1744,7 +1864,107 @@ function buildMatrixPlan(
       sessions: targetPlans.map((target, index) => targetSummary(byId.get(built.plan.sessions[index].sessionId)!, target)),
     },
   };
-  return { file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) }, targetPlans };
+  const withoutDigest = sourceKind === "claude-code"
+    ? { ...common, schema: "agentryx.import-plan/v5", sourceKind } satisfies Omit<MatrixReversePlanFileV5, "digest">
+    : { ...common, schema: "agentryx.import-plan/v4" } satisfies Omit<MatrixReversePlanFileV4, "digest">;
+  return { file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) } as MatrixReversePlanFile, targetPlans };
+}
+
+function buildCodexCliMatrixPlan(
+  sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode,
+  titlePolicy: TitleTransformPolicy | null, activeContextPolicy: ActiveContextPolicy | null,
+  allowWrapperCwdRelocation: boolean, sourceKind: ClaudeSourceKind,
+  runtime: CodexCliRuntime, codexHome: string, claudeHome: string, bridgeRoot: string,
+): { file: MatrixCliTargetPlanFile; targetPlans: CodexCliTargetPlan[] } {
+  if (selection.projectScope === "existing-targets") {
+    throw new Error("--project-scope existing-targets applies only to Codex Desktop targets");
+  }
+  const logicalById = new Map(sources.map((source) => {
+    if (!source.bundle) return [source.session.sessionId, null] as const;
+    return [
+      source.session.sessionId,
+      compactLogicalForTarget(bridgeToLogical(source, renderMode, titlePolicy), activeContextPolicy),
+    ] as const;
+  }));
+  const summaries = summariesForPlan(sources, renderMode, "skip", titlePolicy).map((summary) => {
+    const logical = logicalById.get(summary.sessionId);
+    const sourceArchived = summary.archiveState === "archived";
+    const losses = [
+      ...(summary.losses ?? []),
+    ...(summary.archiveState === "unknown" ? [{
+      kind: "source_archive_state_unknown",
+      count: 1,
+      detail: "Claude Code has no Desktop wrapper archive flag; the imported Codex CLI rollout will be active.",
+    }] : []),
+      ...(sourceArchived ? [{
+        kind: "target_archive_not_supported",
+        count: 1,
+        detail: "The Codex CLI file target cannot register an archived thread; this imported rollout will be active.",
+      }] : []),
+      ...(logical?.synthesized ? [{
+        kind: "synthetic_compaction_for_target_limit",
+        count: 1,
+        detail: `Full history is retained before the boundary and in the bridge sidecar; active context is capped at ${activeContextPolicy!.maxUtf8Bytes} UTF-8 bytes.`,
+      }] : []),
+    ];
+    if (losses.length === (summary.losses ?? []).length) return summary;
+    return {
+      ...summary,
+      losses,
+    };
+  });
+  const built = buildImportPlan(summaries, { selection });
+  const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
+  const targetPlans = built.plan.sessions.map((selected) => {
+    const source = byId.get(selected.sessionId);
+    const logical = logicalById.get(selected.sessionId);
+    if (!source?.bundle || !selected.sourceSha256 || !logical) {
+      throw new Error(`source is unavailable: ${selected.sessionId}`);
+    }
+    return planCodexCliTarget(
+      codexHome, selected.sessionId, selected.sourceSha256, logical.conversation, runtime,
+    );
+  });
+  for (let index = 0; index < targetPlans.length; index += 1) {
+    const state = inspectCodexCliTarget(targetPlans[index]!);
+    const selected = built.plan.sessions[index]!;
+    selected.targetConversationExists = state !== "absent";
+    selected.targetConversationState = state === "already-applied" ? "exact-existing" : state;
+  }
+  const withoutDigest: Omit<MatrixCliTargetPlanFile, "digest"> = {
+    schema: "agentryx.import-plan/v6",
+    direction: "claude-to-codex",
+    sourceKind,
+    targetKind: "codex-cli",
+    renderMode,
+    goalMode: "skip",
+    titlePolicy,
+    activeContextPolicy,
+    allowWrapperCwdRelocation,
+    plan: built.plan,
+    target: {
+      codexHome: path.resolve(codexHome),
+      claudeHome: path.resolve(claudeHome),
+      bridgeRoot: path.resolve(bridgeRoot),
+      cliVersion: runtime.version,
+      modelProvider: runtime.modelProvider,
+      cliExecutablePath: runtime.executablePath,
+      cliExecutableSha256: runtime.executableSha256,
+      rendererId: CODEX_CLI_RENDERER_ID,
+      sessions: targetPlans.map((target, index) => ({
+        sourceSessionId: built.plan.sessions[index]!.sessionId,
+        operationId: target.operationId,
+        targetThreadId: target.targetThreadId,
+        rolloutPath: target.rolloutPath,
+        rolloutSha256: target.rolloutSha256,
+        rolloutBytes: target.rolloutBytes,
+      })),
+    },
+  };
+  return {
+    file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) },
+    targetPlans,
+  };
 }
 
 export function selectionFromPlan(plan: ImportPlan): SelectionOptions {
@@ -1779,11 +1999,13 @@ function assertJsonOutputWritable(target: string | undefined): void {
 
 export const MATRIX_HELP =
   "usage: threadpass <scan|plan|apply|recover> [--archive active|archived|all] " +
+  "[--claude-source desktop|code] [--codex-target desktop|cli] " +
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
   "[--render-mode semantic|verbatim] [--goal-mode migrate|skip] [--no-migrate-goal] " +
   "[--title-prefix TEXT] [--replace-title-prefix TEXT] " +
   "[--compact-active-bytes N] [--allow-wrapper-cwd-relocation] " +
+  "[--codex-cli-bin PATH] [--codex-cli-model-provider ID] " +
   "[--direction claude-to-codex|codex-to-claude] [--allow-overwrite] [--dry-run]\n";
 
 function forwardWorkspace(argv: string[], claudeHome: string): string | null {
@@ -1839,6 +2061,158 @@ export function assertGoalMigrationReady(
   }
 }
 
+function applyCodexCliMatrixPlan(
+  argv: string[], stored: MatrixCliTargetPlanFile,
+): void {
+  const confirmation = option(argv, "--confirm");
+  if (!confirmation) throw new Error("Codex CLI apply requires --confirm <plan digest>");
+  if (stored.schema !== "agentryx.import-plan/v6" || stored.direction !== "claude-to-codex" ||
+    stored.targetKind !== "codex-cli" || !["claude-code", "claude-desktop"].includes(stored.sourceKind) ||
+    stored.target.rendererId !== CODEX_CLI_RENDERER_ID || stored.goalMode !== "skip") {
+    throw new Error("unsupported Codex CLI import plan");
+  }
+  assertCurrentImportPlan(stored.plan);
+  const { digest, ...content } = stored;
+  if (matrixPlanDigest(content) !== digest) throw new Error("stored import plan content does not match its digest");
+  if (confirmation !== digest) throw new Error("confirmation digest does not match the plan");
+
+  if (option(argv, "--direction") != null && matrixDirection(argv) !== stored.direction) {
+    throw new Error("apply direction differs from the confirmed plan");
+  }
+  if (option(argv, "--claude-source") != null && claudeSourceKindOption(argv) !== stored.sourceKind) {
+    throw new Error("apply Claude source differs from the confirmed plan");
+  }
+  if (option(argv, "--codex-target") != null && codexTargetKindOption(argv) !== stored.targetKind) {
+    throw new Error("apply Codex target differs from the confirmed plan");
+  }
+  const requestedCodexHome = option(argv, "--codex-home");
+  if (requestedCodexHome != null && path.resolve(requestedCodexHome) !== path.resolve(stored.target.codexHome)) {
+    throw new Error("apply Codex home differs from the confirmed plan");
+  }
+  const requestedClaudeHome = option(argv, "--claude-home");
+  if (requestedClaudeHome != null && path.resolve(requestedClaudeHome) !== path.resolve(stored.target.claudeHome)) {
+    throw new Error("apply Claude home differs from the confirmed plan");
+  }
+  const requestedMode = option(argv, "--render-mode");
+  if (requestedMode != null && parseRenderMode(requestedMode) !== stored.renderMode) {
+    throw new Error("apply render mode differs from the confirmed plan");
+  }
+  const goalExplicit = optionValues(argv, "--goal-mode").length > 0 || flag(argv, "--no-migrate-goal");
+  if (goalExplicit && goalMigrationModeOption(argv) !== "skip") {
+    throw new Error("Codex CLI targets cannot activate live Goals; use --goal-mode skip");
+  }
+  const requestedTitlePolicy = titleTransformPolicyOption(argv);
+  if ((option(argv, "--title-prefix") != null || optionValues(argv, "--replace-title-prefix").length > 0) &&
+    canonicalStringify(requestedTitlePolicy) !== canonicalStringify(stored.titlePolicy)) {
+    throw new Error("apply title transform policy differs from the confirmed plan");
+  }
+  const requestedActiveContextPolicy = activeContextPolicyOption(argv);
+  if (option(argv, "--compact-active-bytes") != null &&
+    canonicalStringify(requestedActiveContextPolicy) !== canonicalStringify(stored.activeContextPolicy)) {
+    throw new Error("apply active context policy differs from the confirmed plan");
+  }
+  if (flag(argv, "--allow-wrapper-cwd-relocation") && !stored.allowWrapperCwdRelocation) {
+    throw new Error("apply wrapper cwd relocation policy differs from the confirmed plan");
+  }
+  if (option(argv, "--workspace-dir") != null) {
+    throw new Error("--workspace-dir applies only to Claude Desktop source selection");
+  }
+  if (option(argv, "--evidence") != null) {
+    throw new Error("--evidence applies only to Codex Desktop targets");
+  }
+  if (flag(argv, "--allow-overwrite")) {
+    throw new Error("Codex CLI target never overwrites an existing rollout");
+  }
+
+  const codexHome = path.resolve(stored.target.codexHome);
+  const runtime = detectCodexCliRuntime(codexHome, {
+    executable: option(argv, "--codex-cli-bin"),
+    modelProvider: option(argv, "--codex-cli-model-provider"),
+  });
+  const sourceArgv = [
+    ...argv,
+    ...(requestedClaudeHome == null ? ["--claude-home", stored.target.claudeHome] : []),
+    ...(requestedCodexHome == null ? ["--codex-home", stored.target.codexHome] : []),
+  ];
+  const loaded = loadSources(
+    sourceArgv,
+    selectionFromPlan(stored.plan),
+    stored.allowWrapperCwdRelocation,
+    stored.sourceKind,
+    "codex-cli",
+  );
+  const requestedBridgeRoot = option(argv, "--bridge-root");
+  if (requestedBridgeRoot != null && path.resolve(requestedBridgeRoot) !== path.resolve(stored.target.bridgeRoot)) {
+    throw new Error("apply bridge root differs from the confirmed plan");
+  }
+  const rebuilt = buildCodexCliMatrixPlan(
+    loaded.sources,
+    selectionFromPlan(stored.plan),
+    stored.renderMode,
+    stored.titlePolicy,
+    stored.activeContextPolicy,
+    stored.allowWrapperCwdRelocation,
+    stored.sourceKind,
+    runtime,
+    codexHome,
+    stored.target.claudeHome,
+    stored.target.bridgeRoot,
+  );
+  if (rebuilt.file.digest !== stored.digest) {
+    throw new Error("source inventory, Codex CLI version/provider, renderer, or target binding changed after planning");
+  }
+
+  if (flag(argv, "--dry-run")) {
+    if (option(argv, "--out") != null) throw new Error("--dry-run refuses --out because it is zero-mutation");
+    const states = rebuilt.targetPlans.map(inspectCodexCliTarget);
+    const blockers = states.flatMap((state, index) => state === "collision"
+      ? [`${rebuilt.targetPlans[index]!.targetThreadId}: target rollout collision`] : []);
+    process.stdout.write(`${JSON.stringify({
+      dryRun: true,
+      digest: stored.digest,
+      target: "codex-cli",
+      cliVersion: runtime.version,
+      modelProvider: runtime.modelProvider,
+      cliExecutablePath: runtime.executablePath,
+      cliExecutableSha256: runtime.executableSha256,
+      writeReadiness: blockers.length === 0 ? "ready" : "blocked",
+      blockers,
+      sessions: rebuilt.targetPlans.map((plan, index) => ({
+        sessionId: stored.plan.sessions[index]!.sessionId,
+        threadId: plan.targetThreadId,
+        rolloutPath: plan.rolloutPath,
+        rolloutBytes: plan.rolloutBytes,
+        state: states[index],
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
+
+  const states = rebuilt.targetPlans.map(inspectCodexCliTarget);
+  const collisions = states.flatMap((state, index) => state === "collision"
+    ? [rebuilt.targetPlans[index]!.rolloutPath] : []);
+  if (collisions.length > 0) throw new Error(`Codex CLI target collision(s): ${collisions.join(", ")}`);
+  assertJsonOutputWritable(option(argv, "--out"));
+  for (const selected of stored.plan.sessions) {
+    const source = loaded.sources.find((candidate) => candidate.session.sessionId === selected.sessionId);
+    if (!source?.bundle) throw new Error(`source is unavailable: ${selected.sessionId}`);
+    writeBridgeConversation(stored.target.bridgeRoot, source.bundle);
+  }
+  const results = rebuilt.targetPlans.map((plan) => applyCodexCliTarget(plan));
+  writeJson(option(argv, "--out"), {
+    direction: stored.direction,
+    sourceKind: stored.sourceKind,
+    targetKind: stored.targetKind,
+    digest: stored.digest,
+    applied: results.filter((result) => result === "applied").length,
+    alreadyApplied: results.filter((result) => result === "already-applied").length,
+    sessions: rebuilt.targetPlans.map((plan) => ({
+      threadId: plan.targetThreadId,
+      rolloutPath: plan.rolloutPath,
+    })),
+  });
+}
+
 export function main(argv = process.argv.slice(2)): void {
   const command = argv[0];
   if (!command) throw new Error(MATRIX_HELP.trimEnd());
@@ -1851,6 +2225,9 @@ export function main(argv = process.argv.slice(2)): void {
     if (selection.archive == null) selection.archive = "all";
     const direction = matrixDirection(argv);
     if (direction === "codex-to-claude") {
+      if (option(argv, "--claude-source") != null || option(argv, "--codex-target") != null) {
+        throw new Error("--claude-source and --codex-target apply only to Claude-to-Codex operations");
+      }
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
       const inventory = loadForwardCodexInventory(codexHome);
       const renderMode = parseRenderMode(option(argv, "--render-mode"));
@@ -1885,14 +2262,19 @@ export function main(argv = process.argv.slice(2)): void {
       return;
     }
     const allowWrapperCwdRelocation = flag(argv, "--allow-wrapper-cwd-relocation");
-    const loaded = loadSources(argv, selection, allowWrapperCwdRelocation);
+    const sourceKind = claudeSourceKindOption(argv);
+    const targetKind = codexTargetKindOption(argv);
+    const loaded = loadSources(argv, selection, allowWrapperCwdRelocation, sourceKind, targetKind);
     const renderMode = parseRenderMode(option(argv, "--render-mode"));
     const goalMode = goalMigrationModeOption(argv);
     const titlePolicy = titleTransformPolicyOption(argv);
     const activeContextPolicy = activeContextPolicyOption(argv);
     const built = buildImportPlan(summariesForPlan(loaded.sources, renderMode, goalMode, titlePolicy), { selection });
     writeJson(option(argv, "--out"), {
-      workspaceDir: loaded.workspaceDir,
+      sourceKind: loaded.sourceKind,
+      targetKind,
+      sourceRoot: loaded.sourceRoot,
+      ...(loaded.sourceKind === "claude-desktop" ? { workspaceDir: loaded.sourceRoot } : {}),
       inventory: {
         total: loaded.inventory.length,
         selected: loaded.sources.length,
@@ -1916,6 +2298,9 @@ export function main(argv = process.argv.slice(2)): void {
   if (command === "plan") {
     const direction = matrixDirection(argv);
     if (direction === "codex-to-claude") {
+      if (option(argv, "--claude-source") != null || option(argv, "--codex-target") != null) {
+        throw new Error("--claude-source and --codex-target apply only to Claude-to-Codex operations");
+      }
       const selection = selectionOptions(argv);
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
       const claudeHome = resolveClaudeHome(option(argv, "--claude-home"));
@@ -1933,12 +2318,39 @@ export function main(argv = process.argv.slice(2)): void {
       writeJson(option(argv, "--out"), matrix.file);
       return;
     }
-    const evidencePath = option(argv, "--evidence");
-    if (!evidencePath) throw new Error("plan requires --evidence <41059 snapshot manifest>");
     const selection = selectionOptions(argv);
     const allowWrapperCwdRelocation = flag(argv, "--allow-wrapper-cwd-relocation");
-    const loaded = loadSources(argv, selection, allowWrapperCwdRelocation);
+    const sourceKind = claudeSourceKindOption(argv);
+    const targetKind = codexTargetKindOption(argv);
+    const loaded = loadSources(argv, selection, allowWrapperCwdRelocation, sourceKind, targetKind);
     const codexHome = resolveCodexHome(option(argv, "--codex-home"));
+    if (targetKind === "codex-cli") {
+      if (option(argv, "--evidence") != null) {
+        throw new Error("--evidence applies only to Codex Desktop targets");
+      }
+      const explicitGoalMode = optionValues(argv, "--goal-mode").length > 0 || flag(argv, "--no-migrate-goal");
+      const goalMode = explicitGoalMode ? goalMigrationModeOption(argv) : "skip";
+      if (goalMode !== "skip") {
+        throw new Error("Codex CLI targets cannot activate live Goals; use --goal-mode skip");
+      }
+      const renderMode = parseRenderMode(option(argv, "--render-mode"));
+      const titlePolicy = titleTransformPolicyOption(argv);
+      const activeContextPolicy = activeContextPolicyOption(argv);
+      const runtime = detectCodexCliRuntime(codexHome, {
+        executable: option(argv, "--codex-cli-bin"),
+        modelProvider: option(argv, "--codex-cli-model-provider"),
+      });
+      const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
+      const matrix = buildCodexCliMatrixPlan(
+        loaded.sources, selection, renderMode, titlePolicy, activeContextPolicy,
+        allowWrapperCwdRelocation, sourceKind, runtime, codexHome,
+        resolveClaudeHome(option(argv, "--claude-home")), bridgeRoot,
+      );
+      writeJson(option(argv, "--out"), matrix.file);
+      return;
+    }
+    const evidencePath = option(argv, "--evidence");
+    if (!evidencePath) throw new Error("plan requires --evidence <41059 snapshot manifest>");
     const dbPath = findStateDb(codexHome);
     if (!dbPath) throw new Error(`no Codex state database found under ${codexHome}`);
     const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
@@ -1949,6 +2361,7 @@ export function main(argv = process.argv.slice(2)): void {
     const matrix = buildMatrixPlan(
       loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")), goalMode, titlePolicy,
       activeContextPolicy, allowWrapperCwdRelocation,
+      sourceKind,
       codexHome, dbPath, bridgeRoot, evidence,
     );
     writeJson(option(argv, "--out"), matrix.file);
@@ -2001,9 +2414,14 @@ export function main(argv = process.argv.slice(2)): void {
     if ((candidate.schema === "agentryx.import-plan/v2" || candidate.schema === "agentryx.import-plan/v3")) {
       throw new Error(`unsupported persisted import-plan schema ${String(candidate.schema)}; ${REGENERATE_PLAN_MESSAGE}`);
     }
-    if (candidate.schema === "agentryx.import-plan/v4" &&
+    if ((candidate.schema === "agentryx.import-plan/v4" || candidate.schema === "agentryx.import-plan/v5") &&
       (candidate.direction === "codex-to-claude" || candidate.direction === "claude-to-codex")) {
       assertCurrentImportPlan(candidate.plan);
+    }
+    if (candidate.schema === "agentryx.import-plan/v6" && candidate.direction === "claude-to-codex") {
+      assertCurrentImportPlan(candidate.plan);
+      applyCodexCliMatrixPlan(argv, candidate as unknown as MatrixCliTargetPlanFile);
+      return;
     }
     if (candidate.schema === "agentryx.import-plan/v4" && candidate.direction === "codex-to-claude") {
       const stored = candidate as unknown as MatrixForwardPlanFile;
@@ -2111,11 +2529,20 @@ export function main(argv = process.argv.slice(2)): void {
     throw new Error("apply requires --plan, --evidence, and --confirm <plan digest>");
   }
   const stored = JSON.parse(fs.readFileSync(planPath, "utf8")) as MatrixPlanFile;
-  if (stored.schema !== "agentryx.import-plan/v4" || stored.direction !== "claude-to-codex" ||
+  if ((stored.schema !== "agentryx.import-plan/v4" && stored.schema !== "agentryx.import-plan/v5") ||
+    stored.direction !== "claude-to-codex" ||
     !["semantic", "verbatim"].includes(stored.renderMode) ||
     !["migrate", "skip"].includes(stored.goalMode) ||
     stored.target.privateWriteProfile?.schema !== "pass-the-thread/codex-private-write-profile-v1") {
     throw new Error("unsupported import plan");
+  }
+  const sourceKind: ClaudeSourceKind = stored.schema === "agentryx.import-plan/v5"
+    ? stored.sourceKind : "claude-desktop";
+  if (stored.schema === "agentryx.import-plan/v5" && sourceKind !== "claude-code") {
+    throw new Error("unsupported Claude source kind in import plan");
+  }
+  if (option(argv, "--claude-source") != null && claudeSourceKindOption(argv) !== sourceKind) {
+    throw new Error("apply Claude source differs from the confirmed plan");
   }
   const storedTitlePolicy = storedTitleTransformPolicy(stored.titlePolicy);
   const storedActiveContextPolicy = parseStoredActiveContextPolicy(stored.activeContextPolicy);
@@ -2123,7 +2550,8 @@ export function main(argv = process.argv.slice(2)): void {
     throw new Error("unsupported wrapper cwd relocation policy");
   }
   assertCurrentImportPlan(stored.plan);
-  const storedContent: Omit<MatrixReversePlanFile, "digest"> = {
+  const storedContent = {
+    ...(stored.schema === "agentryx.import-plan/v5" ? { sourceKind: stored.sourceKind } : {}),
     schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
     goalMode: stored.goalMode, titlePolicy: storedTitlePolicy,
     activeContextPolicy: storedActiveContextPolicy,
@@ -2158,7 +2586,7 @@ export function main(argv = process.argv.slice(2)): void {
     throw new Error("apply wrapper cwd relocation policy differs from the confirmed plan");
   }
   const loaded = loadSources(
-    argv, selectionFromPlan(stored.plan), stored.allowWrapperCwdRelocation,
+    argv, selectionFromPlan(stored.plan), stored.allowWrapperCwdRelocation, sourceKind,
   );
   const codexHome = resolveCodexHome(option(argv, "--codex-home"));
   const dbPath = findStateDb(codexHome);
@@ -2168,6 +2596,7 @@ export function main(argv = process.argv.slice(2)): void {
   const rebuilt = buildMatrixPlan(
     loaded.sources, selectionFromPlan(stored.plan), stored.renderMode, stored.goalMode, storedTitlePolicy,
     storedActiveContextPolicy, stored.allowWrapperCwdRelocation,
+    sourceKind,
     codexHome, dbPath, bridgeRoot, evidence,
   );
   if (rebuilt.file.digest !== stored.digest) {
@@ -2213,7 +2642,7 @@ export function main(argv = process.argv.slice(2)): void {
     return;
   }
   assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID);
-  const byId = new Map(loaded.sources.map((source) => [source.desktop.sessionId, source]));
+  const byId = new Map(loaded.sources.map((source) => [source.session.sessionId, source]));
   const operations: Array<{ sessionId: string; operationId: string; threadId: string; status: "applied" | "already-applied" }> = [];
   const lock = beginReverseApply(
     rebuilt.targetPlans, bridgeRoot, dbPath, option(argv, "--out"), codexHome,

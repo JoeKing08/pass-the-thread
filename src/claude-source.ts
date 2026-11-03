@@ -13,6 +13,8 @@ export interface ClaudeSourceTranscript {
   cwd: string | null;
   cwds: string[];
   title: string | null;
+  firstTsMs: number | null;
+  lastTsMs: number | null;
 }
 
 /**
@@ -87,6 +89,8 @@ export function readClaudeJsonl(
   const sessionValues = new Set<string>();
   const cwdValues = new Set<string>();
   let firstFallbackTitle: string | null = null;
+  let firstTsMs: number | null = null;
+  let lastTsMs: number | null = null;
   const sourceContentSha256 = (() => {
     try {
       return forEachClaudeUtf8LineSync(sourcePath, (raw, recordIndex, lineEnding) => {
@@ -94,6 +98,13 @@ export function readClaudeJsonl(
         if (retainRecords) records.push(envelope);
         const record = asRecord(envelope.parsed);
         if (record == null) return;
+        if (typeof record.timestamp === "string") {
+          const timestamp = Date.parse(record.timestamp);
+          if (Number.isFinite(timestamp)) {
+            firstTsMs ??= timestamp;
+            lastTsMs = timestamp;
+          }
+        }
         for (const key of ["sessionId", "cwd"]) {
           const value = record[key];
           if (typeof value === "string" && value !== "") {
@@ -140,6 +151,8 @@ export function readClaudeJsonl(
     cwd: firstValues.get("cwd") ?? null,
     cwds: [...cwdValues].sort(),
     title,
+    firstTsMs,
+    lastTsMs,
   };
 }
 
@@ -157,8 +170,10 @@ export function discoverClaudeTranscripts(claudeHome: string): string[] {
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
       const child = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(child);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) found.push(child);
+      if (entry.isDirectory() && entry.name !== "subagents") walk(child);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl") && !entry.name.startsWith("agent-")) {
+        found.push(child);
+      }
     }
   };
   walk(root);

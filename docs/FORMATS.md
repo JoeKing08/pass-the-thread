@@ -2,6 +2,28 @@
 
 What this tool reads and writes. These are **undocumented, internal** formats of two proprietary desktop apps, reconstructed by observation. They can change without notice.
 
+## Source — Claude Code transcript
+
+`~/.claude/projects/<project-key>/<session-id>.jsonl`, one Claude transcript
+record per line. The importer verifies that the filename id matches the single
+session id and cwd recorded in the transcript. `agent-*.jsonl` and nested
+`subagents` directories are not main conversations and are excluded. Claude
+Code does not use Claude Desktop's `local_<uuid>.json` session wrappers, so
+archive state remains unknown and is not inferred from file placement. Reverse
+plans require `--archive all`; the newly created Codex target is active.
+
+## Target — Codex CLI on Linux
+
+The file-only target writes one new
+`~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl` using the same
+typed rollout renderer as the audited Desktop adapter, with `source: "cli"`,
+`originator: "codex_cli_rs"`, and the installed CLI version. It does not write
+the Desktop `state_<n>.sqlite` index. The target UUID is deterministic from the
+source session id and source digest. Publication uses an exclusive hard link
+from a fully flushed same-directory stage file: an existing identical rollout
+is idempotent; any differing file or matching UUID at another session path is
+a collision and is never overwritten.
+
 ## Source — Codex rollout
 
 `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl`, one JSON object per line:

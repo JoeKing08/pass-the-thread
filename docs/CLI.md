@@ -5,9 +5,9 @@ threadpass list    [options] [--json]
 threadpass import  [options] [--dry-run] [--force]
 threadpass fix     [--dry-run] [--prune]
 threadpass scan    [selection]
-threadpass plan    [selection] --evidence <manifest.json> --out <plan.json>
-threadpass apply   --plan <plan.json> --confirm <digest> --evidence <manifest.json>
-threadpass recover --operation <id> --evidence <manifest.json>
+threadpass plan    [selection] [--evidence <manifest.json>] --out <plan.json>
+threadpass apply   --plan <plan.json> --confirm <digest> [--evidence <manifest.json>]
+threadpass recover --operation <id> [--evidence <manifest.json>]
 threadpass handoff <header|resolve|read> [selection] [--allow-cross-project]
 ```
 
@@ -83,9 +83,9 @@ flow. `codex-to-claude` remains an executable alias for compatibility.
 
 ```text
 threadpass scan  [selection]
-threadpass plan  [selection] --render-mode <mode> --goal-mode <mode> --evidence <manifest.json> --out <plan.json>
-threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json> [--dry-run]
-threadpass recover --operation <id> --evidence <manifest.json>
+threadpass plan  [selection] --render-mode <mode> --goal-mode <mode> [--evidence <manifest.json>] --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest> [--evidence <manifest.json>] [--dry-run]
+threadpass recover --operation <id> [--evidence <manifest.json>]
 ```
 
 Codex → Claude uses the same commands with `--direction codex-to-claude`:
@@ -96,6 +96,36 @@ threadpass apply --plan <plan.json> --confirm <digest> [--dry-run] [--allow-over
 threadpass recover --operation <id>
 ```
 
+Claude → Codex reads Claude Desktop by default. Native Claude Code JSONL
+transcripts can be selected without Desktop's wrapper database. The default
+Codex target remains the audited Windows Desktop importer. On Linux, the
+experimental file-only Codex CLI target writes a native rollout without a
+Desktop database registration:
+
+```text
+threadpass scan --claude-source code --claude-home <~/.claude> --archive all
+threadpass scan --claude-source code --codex-target cli --claude-home <~/.claude> --archive all
+threadpass plan --claude-source code --codex-target cli --claude-home <~/.claude> --archive all --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest>
+```
+
+The source is `~/.claude/projects/<project>/<session-id>.jsonl`; agent
+transcripts and subagent sidecars are excluded. Claude Code has no Desktop
+wrapper archive flag, so its archive state remains `unknown`: planning must use
+`--archive all`. The imported Codex thread is created active, and the plan binds
+`sourceKind: claude-code`. Existing Desktop plans remain v4 and continue to
+apply as before; Claude Code/Desktop to Codex Desktop plans use v5. Codex CLI
+target plans use v6 and bind the detected CLI version and executable hash,
+configured model provider, renderer, and exact rollout path/hash. CLI plans
+default live Goal migration to `skip`; they cannot activate a Codex-native Goal.
+Archived source sessions are created active and the plan reports that loss.
+`--codex-cli-bin`
+and `--codex-cli-model-provider` override local detection and must be repeated
+on apply if used while planning. The target is Linux-only for now. It creates
+new active rollouts atomically, never overwrites a file, and refuses a UUID/path
+collision; use `codex resume <thread-id>` to open the imported conversation.
+`--evidence` is required for the Desktop target and rejected for the CLI target.
+
 `scan` and `plan` are read-only with respect to Codex and Claude data. With no
 archive option, `scan` inventories active and archived records; `plan` safely
 defaults to active. A plan's SHA-256 digest binds the selected source revisions,
@@ -105,10 +135,11 @@ Goal target thread/readback, and separate rollout, thread-index, archive,
 project-identity, and Goal capability fingerprints. `apply`
 rebuilds all of it and refuses if any binding changed.
 
-Persisted matrix envelopes use `agentryx.import-plan/v4` and contain nested
-ImportPlan version `3`. Apply validates both versions before digesting or
-rebuilding; older v2/v3 envelopes or nested v2 plans must be regenerated with
-the current `threadpass`.
+Persisted forward plans and Claude Desktop reverse plans use
+`agentryx.import-plan/v4`; Claude Code reverse plans use v5 to bind the source
+kind; Codex CLI target plans use v6. All contain nested ImportPlan version `3`. Apply validates both versions
+before digesting or rebuilding; older v2/v3 envelopes or nested v2 plans must be
+regenerated with the current `threadpass`.
 
 Unknown or newer Codex builds may still be scanned and may produce plans and
 dry-run reports. Their private-write capabilities are null, so real apply and
@@ -167,11 +198,15 @@ Selection options:
 | --- | --- |
 | `--archive` | `active` (default), `archived`, or `all` |
 | `--project-scope` | `all`, `projects`, `projectless`, or `existing-targets`; the last means an existing canonical target project/group/root, not an existing conversation |
-| `--session <id>` | exact source id shown by `scan` (Claude wrapper `sessionId` for Claude → Codex; Codex rollout id for Codex → Claude); repeat for an OR-list |
+| `--session <id>` | exact source id shown by `scan` (Claude wrapper/Code `sessionId` for Claude → Codex; Codex rollout id for Codex → Claude); repeat for an OR-list |
 | `--project <name-or-path>` | exact target project name or canonical root; repeat for an OR-list |
 | `--from-date`, `--to-date` | inclusive ISO bounds on source activity: Claude wrapper `lastActivityAt` then `createdAt`, or Codex index `updatedAt` then latest rollout timestamp |
 | `--limit <n>` | explicit newest-first cap; omitted means no cap |
 | `--workspace-dir` | exact Claude Desktop account/device record directory |
+| `--claude-source <kind>` | `desktop` (default) or `code`; Claude → Codex only |
+| `--codex-target <kind>` | `desktop` (default) or `cli`; Claude → Codex only; CLI target is Linux-only |
+| `--codex-cli-bin <path>` | `codex` from `PATH` by default; CLI target only |
+| `--codex-cli-model-provider <id>` | top-level Codex config provider by default; CLI target only |
 | `--claude-home`, `--codex-home`, `--sessions-root` | override detected roots |
 | `--out <path>` | JSON output file; omitted or `-` writes stdout; forbidden by `apply --dry-run` |
 | `--render-mode <mode>` | `semantic` (default) or `verbatim`; included in the plan digest |
