@@ -126,6 +126,29 @@ new active rollouts atomically, never overwrites a file, and refuses a UUID/path
 collision; use `codex resume <thread-id>` to open the imported conversation.
 `--evidence` is required for the Desktop target and rejected for the CLI target.
 
+DeepSeek Harness and Grok Build can be imported one way into the Codex CLI
+target. These directions do not write Claude history and do not read back into
+DSH or Grok Build:
+
+```text
+threadpass scan --source dsh --dsh-home <~/.dsh> --archive all
+threadpass plan --source dsh --dsh-session <session.v4.jsonl.zstd> --archive all --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest>
+
+threadpass scan --source grok-build --grok-build-session <session-dir> --archive all
+threadpass plan --source grok-build --grok-build-home <~/.grok> --archive all --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest>
+```
+
+`--source dsh` inventories `session.vN.jsonl[.zstd]` under `$DSH_HOME` or
+`~/.dsh` (override with `--dsh-home` or a single `--dsh-session` file/directory).
+`--source grok-build` inventories directories that contain `summary.json` and
+`updates.jsonl` (`--grok-build-home` or `--grok-build-session`). Both default to
+`--codex-target cli` and currently refuse the Desktop target. Archive state is
+unknown, so plans require `--archive all`. One-way CLI plans use v7 and bind
+`direction` (`dsh-to-codex` or `grok-build-to-codex`), the source home, and the
+same CLI runtime/rollout hashes as v6.
+
 `scan` and `plan` are read-only with respect to Codex and Claude data. With no
 archive option, `scan` inventories active and archived records; `plan` safely
 defaults to active. A plan's SHA-256 digest binds the selected source revisions,
@@ -137,7 +160,7 @@ rebuilds all of it and refuses if any binding changed.
 
 Persisted forward plans and Claude Desktop reverse plans use
 `agentryx.import-plan/v4`; Claude Code reverse plans use v5 to bind the source
-kind; Codex CLI target plans use v6. All contain nested ImportPlan version `3`. Apply validates both versions
+kind; Codex CLI target plans use v6; DSH/Grok Build to Codex CLI plans use v7. All contain nested ImportPlan version `3`. Apply validates both versions
 before digesting or rebuilding; older v2/v3 envelopes or nested v2 plans must be
 regenerated with the current `threadpass`.
 

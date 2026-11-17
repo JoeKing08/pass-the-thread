@@ -19,6 +19,11 @@
 /reference/codex-desktop/26.721.41059/manifest.json text eol=lf
 /reference/codex-desktop/26.721.41059/README.md text eol=lf
 /src/cli.ts text eol=lf
+/src/dsh-source.ts text eol=lf
+/src/dsh-to-ir.ts text eol=lf
+/src/grok-build-source.ts text eol=lf
+/src/grok-build-to-ir.ts text eol=lf
+/src/zstd-frames.ts text eol=lf
 /src/claude-code-source.ts text eol=lf
 /src/codex-cli-target.ts text eol=lf
 /src/codex-goal-target.ts text eol=lf

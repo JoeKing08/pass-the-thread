@@ -71,6 +71,16 @@ test("typed semantic renderer makes controls inert while preserving native tool 
   assert.match(JSON.stringify(lines[toolLine + 1]), /tool_result/);
 });
 
+test("typed renderer writes Claude's native Windows cwd spelling", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-cwd-"));
+  const { session } = fixture(root);
+  session.cwd = "c:\\Users\\ssal\\repo";
+  const bundle = codexRolloutToBridgeBundle(session);
+  session.sourceContentSha256 = bundle.conversation.sourceContentSha256;
+  const lines = renderForwardClaudeTranscript(session, bundle, { renderMode: "semantic", goalMode: "skip" });
+  assert.ok(lines.every((line) => line.cwd === "C:\\Users\\ssal\\repo"));
+});
+
 test("semantic renderer preserves image-only user turns and keeps reasoning inert", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-media-"));
   const id = "22222222-3333-4444-8555-666666666666";

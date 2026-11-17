@@ -8,6 +8,7 @@ import type {
   ClaudeTranscriptRecord,
   CodexSession,
 } from "./types.ts";
+import { recordCwd } from "./paths.ts";
 
 export const CLAUDE_GOAL_TARGET_CAPABILITY_ID = "claude.goal-transcript/v1";
 export const CLAUDE_GOAL_MAX_CONDITION_CHARS = 4000;
@@ -89,7 +90,7 @@ function common(
     parentUuid: last?.uuid ?? null,
     isSidechain: false as const,
     userType: "external",
-    cwd: session.cwd,
+    cwd: recordCwd(session.cwd),
     sessionId: session.sessionId,
     version: last?.version ?? "0.0.0-codex-import",
     timestamp: timestampFor(session, records),

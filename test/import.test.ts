@@ -41,7 +41,7 @@ import { keySeparator } from "../src/project-identity.ts";
 import { loadThreadNames, nameFromThreadRow } from "../src/codex-thread-names.ts";
 import { renderCitation, splitCitations } from "../src/citation.ts";
 import { validateTranscript } from "../src/validate.ts";
-import { encodeProjectDir } from "../src/paths.ts";
+import { encodeProjectDir, recordCwd } from "../src/paths.ts";
 import { parseRenderMode } from "../src/render-mode.ts";
 import { claudeGoalHistoryIdentity } from "../src/claude-goal-target.ts";
 import type { CodexSession } from "../src/types.ts";
@@ -211,11 +211,19 @@ test("targetPathFor encodes cwd the Claude Code way", () => {
   assert.equal(targetPath, path.join(tmp, "projects", "-home-u-proj", `${SID}.jsonl`));
 });
 
-test("Windows drive letter is lowercased to match Claude Code folders", () => {
+test("Windows drive letter is lowercased to match Claude Code project folders", () => {
   // real observation: Codex cwd "C:\\_projects\\Agentryx-ai" must map to the
   // same folder Claude Code created from "c:\\_projects\\Agentryx-ai".
   assert.equal(encodeProjectDir("C:\\_projects\\Agentryx-ai"), "c---projects-Agentryx-ai");
   assert.equal(encodeProjectDir("c:\\_projects\\Agentryx-ai"), "c---projects-Agentryx-ai");
+});
+
+test("Windows transcript cwd matches Claude Code's native resume identity", () => {
+  assert.equal(recordCwd("c:\\Users\\ssal\\repo"), "C:\\Users\\ssal\\repo");
+  const s = fixtureSession();
+  s.cwd = "c:\\Users\\ssal\\repo";
+  assert.ok(mapSessionToClaudeLines(s).every((line) => line.cwd === "C:\\Users\\ssal\\repo"));
+  assert.ok(mapVerbatimRolloutToClaudeLines(s).every((line) => line.cwd === "C:\\Users\\ssal\\repo"));
 });
 
 test("end-to-end import writes a resumable transcript and dedups on re-run", () => {

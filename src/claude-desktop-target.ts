@@ -15,6 +15,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ClaudeTranscriptRecord } from "./types.ts";
 import { mapEffort, mapPermissionMode } from "./policy.ts";
+import { recordCwd } from "./paths.ts";
+export { recordCwd } from "./paths.ts";
 
 
 export interface WrapperRecord {
@@ -410,10 +412,6 @@ export interface BuildRecordInput {
  * case-insensitive anyway. The byte-exact source spelling is preserved in the
  * bridge sidecar, not in a field the sidebar groups on.
  */
-export function recordCwd(cwd: string): string {
-  return /^[A-Za-z]:/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
-}
-
 export function buildWrapperRecord(input: BuildRecordInput): WrapperRecord {
   const first = input.lines[0];
   const last = input.lines[input.lines.length - 1];

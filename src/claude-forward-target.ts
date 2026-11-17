@@ -14,10 +14,11 @@ import { locateTranscriptFrom, serializeLines, sha256File, sha256Text } from "./
 import type { TargetContentClass } from "./continued.ts";
 import { buildWrapperRecord, type WrapperRecord } from "./claude-desktop-target.ts";
 import type { AnthropicBlock, ClaudeTranscriptLine, ClaudeTranscriptRecord, CodexSession } from "./types.ts";
+import { recordCwd } from "./paths.ts";
 
 export const CLAUDE_FORWARD_RENDERER_ID = "claude.typed-history-renderer/v1" as const;
 export const CLAUDE_FORWARD_RENDERER_FINGERPRINT = createHash("sha256").update(
-  "pass-the-thread:claude.typed-history-renderer/v1:semantic-verbatim:goal-v1:deterministic-uuid:sidecar-controls",
+  "pass-the-thread:claude.typed-history-renderer/v1:semantic-verbatim:goal-v1:deterministic-uuid:sidecar-controls:native-windows-cwd",
 ).digest("hex");
 
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
@@ -107,6 +108,7 @@ export function renderForwardClaudeTranscript(
     throw new Error(`typed source hash mismatch for ${session.sessionId}`);
   }
   const gitBranch = session.meta.git?.branch;
+  const cwd = recordCwd(session.cwd);
   let parentUuid: string | null = null;
   let sequence = 0;
   const lines: ClaudeTranscriptLine[] = [];
@@ -119,7 +121,7 @@ export function renderForwardClaudeTranscript(
     if (blocks.length === 0) return;
     const recordUuid = uuid(`${bundle.conversation.sourceContentSha256}:${event.id}:${sequence++}`);
     const line: ClaudeTranscriptLine = {
-      parentUuid, isSidechain: false, userType: "external", cwd: session.cwd,
+      parentUuid, isSidechain: false, userType: "external", cwd,
       sessionId: session.sessionId, version: "0.0.0-pass-the-thread", type,
       message: type === "assistant"
         ? { role: "assistant", content: blocks, ...(session.model ? { model: session.model } : {}) }
@@ -213,7 +215,7 @@ export function renderForwardClaudeTranscript(
         if (index !== lastPortableBoundaryIndex) continue;
         const recordUuid = uuid(`${bundle.conversation.sourceContentSha256}:${event.id}:${sequence++}`);
         const line: ClaudeTranscriptLine = {
-          parentUuid, isSidechain: false, userType: "external", cwd: session.cwd,
+          parentUuid, isSidechain: false, userType: "external", cwd,
           sessionId: session.sessionId, version: "0.0.0-pass-the-thread", type: "system",
           subtype: "compact_boundary", compactMetadata: {}, message: { role: "user", content: [] },
           uuid: recordUuid, timestamp: iso(event, session),

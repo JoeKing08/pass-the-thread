@@ -8,7 +8,7 @@ import type {
   ImportHistory,
   ImportHistoryRecord,
 } from "./types.ts";
-import { encodeProjectDir } from "./paths.ts";
+import { encodeProjectDir, recordCwd } from "./paths.ts";
 import {
   decodeCanonicalUtf8,
   inertHistoricalNotice,
@@ -277,7 +277,7 @@ export function mapVerbatimRolloutToClaudeLines(
     parentUuid: null,
     isSidechain: false,
     userType: "external",
-    cwd: session.cwd,
+    cwd: recordCwd(session.cwd),
     sessionId: session.sessionId,
     version: opts.version ?? "0.0.0-codex-import",
     type: "user",

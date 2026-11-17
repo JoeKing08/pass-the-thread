@@ -7,6 +7,7 @@ import type {
 import { splitUserMessage } from "./preamble.ts";
 import { splitCitations } from "./citation.ts";
 import { applyActiveBudget, repairTranscript } from "./repair.ts";
+import { recordCwd } from "./paths.ts";
 
 export interface MapOptions {
   /** Value written to each line's `version` field. */
@@ -170,6 +171,7 @@ export function mapSessionToClaudeLines(
   const maxToolChars = opts.maxToolChars ?? DEFAULT_MAX_TOOL_CHARS;
   const gitBranch = session.meta.git?.branch;
   const model = session.model ?? undefined;
+  const cwd = recordCwd(session.cwd);
 
   let lines: ClaudeTranscriptLine[] = [];
   let parentUuid: string | null = null;
@@ -195,7 +197,7 @@ export function mapSessionToClaudeLines(
       parentUuid,
       isSidechain: false,
       userType: "external",
-      cwd: session.cwd,
+      cwd,
       sessionId: session.sessionId,
       version,
       type,
@@ -283,7 +285,7 @@ export function mapSessionToClaudeLines(
         parentUuid,
         isSidechain: false,
         userType: "external",
-        cwd: session.cwd,
+        cwd,
         sessionId: session.sessionId,
         version,
         type: "system",

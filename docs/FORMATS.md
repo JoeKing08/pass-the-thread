@@ -1,6 +1,6 @@
 # Formats
 
-What this tool reads and writes. These are **undocumented, internal** formats of two proprietary desktop apps, reconstructed by observation. They can change without notice.
+What this tool reads and writes. Codex and Claude formats are **undocumented, internal** formats of two proprietary desktop apps, reconstructed by observation. DeepSeek Harness and Grok Build session packages are read one way into Codex. These formats can change without notice.
 
 ## Source — Claude Code transcript
 
@@ -11,6 +11,37 @@ session id and cwd recorded in the transcript. `agent-*.jsonl` and nested
 Code does not use Claude Desktop's `local_<uuid>.json` session wrappers, so
 archive state remains unknown and is not inferred from file placement. Reverse
 plans require `--archive all`; the newly created Codex target is active.
+
+## Source — DeepSeek Harness session log
+
+Default root `$DSH_HOME` or `~/.dsh`. Each session lives under
+`sessions/<project-slug>/<session-id>/` and is stored as `session.vN.jsonl.zstd`
+(highest `N` wins) or an uncompressed `.jsonl`. The compressed artifact is a
+concatenation of independent checksummed Zstandard frames, not one frame: the
+first frame is the `type: "session"` header, and later frames are append
+batches. The header records `version`, `id`, `createdAt` (epoch milliseconds),
+`cwd`, and optional `agentPreset` / `delegationDepth`. Subsequent events are
+`{ type, seq, time, data, sourceEventSeqs?, surfaceOp? }`.
+
+The importer projects `user/message` with `data.source.kind === "user"` as human
+text, other user/system injections as historical context, `assistant/message`
+text and reasoning, `tool/call` / `tool/result` pairs, `goal/change`, and the
+latest `compaction/summary`. `surfaceOp.replace` ranges are dropped from the
+rendered history but kept byte-exact in the bridge sidecar. The import is
+one-way into Codex; there is no DSH writer.
+
+## Source — Grok Build session package
+
+A session directory contains `summary.json` and `updates.jsonl`. Optional
+`chat_history.jsonl` is treated as a projection and is not the source of truth.
+`summary.json` supplies `info.id`, `info.cwd`, titles, and timestamps.
+`updates.jsonl` is one `{ timestamp, method, params }` record per line, with
+`method` `session/update` or `_x.ai/session/update` and
+`params.update.sessionUpdate` values such as `user_message_chunk`,
+`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`,
+`turn_completed`, and `background_tasks`. Message chunks are concatenated as
+deltas; tool calls are paired by `toolCallId`. The import is one-way into
+Codex; there is no Grok Build writer.
 
 ## Target — Codex CLI on Linux
 

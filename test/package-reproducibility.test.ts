@@ -145,9 +145,9 @@ test("npm pack is byte-identical across fresh Windows checkout line-ending modes
   const lfEntries = tarEntries(lfTarball);
   const crlfEntries = tarEntries(crlfTarball);
   const countHint = "packaged entry count changed: give the new file a `text eol=lf` line in .gitattributes before updating this count. A new src file counts too, because it emits a new dist entry and CR survives inside multi-line template literals.";
-  assert.equal(authoritativeEntries.size, 66, countHint);
-  assert.equal(lfEntries.size, 66, countHint);
-  assert.equal(crlfEntries.size, 66, countHint);
+  assert.equal(authoritativeEntries.size, 71, countHint);
+  assert.equal(lfEntries.size, 71, countHint);
+  assert.equal(crlfEntries.size, 71, countHint);
   const differingEntries = (left: Map<string, Buffer>, right: Map<string, Buffer>) => [
     ...new Set([...left.keys(), ...right.keys()]),
   ]

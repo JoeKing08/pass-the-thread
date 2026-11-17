@@ -17,16 +17,20 @@ export function resolveClaudeHome(override?: string): string {
   return path.join(os.homedir(), ".claude");
 }
 
-/**
- * Normalize a cwd to match Claude Code's on-disk convention.
- * Observed: Claude Code stores Windows paths with a lowercase drive letter
- * (`c:\...`) while Codex stores an uppercase drive (`C:\...`). Lowercasing the
- * drive lets an imported session co-locate with the same project's existing
- * Claude sessions instead of creating a separate project entry.
- */
+/** Normalize a cwd for Claude Code's encoded project-directory name. */
 export function normalizeCwd(cwd: string): string {
   if (/^[A-Za-z]:/.test(cwd)) return cwd[0].toLowerCase() + cwd.slice(1);
   return cwd;
+}
+
+/**
+ * Normalize a cwd written inside a transcript or Desktop wrapper record.
+ * Claude's native Windows sessions use the drive spelling returned by the
+ * process (`C:\...`) and compare that record identity case-sensitively when
+ * resuming, even though Windows resolves `c:\...` to the same directory.
+ */
+export function recordCwd(cwd: string): string {
+  return /^[A-Za-z]:/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
 }
 
 /**

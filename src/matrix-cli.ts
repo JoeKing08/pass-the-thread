@@ -26,6 +26,22 @@ import {
 } from "./codex-cli-target.ts";
 import { readClaudeJsonl } from "./claude-source.ts";
 import { claudeTranscriptToIr } from "./claude-to-ir.ts";
+import {
+  dshSessionIdentityError,
+  inventoryDsh,
+  readDshSessionLog,
+  resolveDshHome,
+  type DshSourceSession,
+} from "./dsh-source.ts";
+import { dshSessionToIr } from "./dsh-to-ir.ts";
+import {
+  grokBuildSessionIdentityError,
+  inventoryGrokBuild,
+  readGrokBuildSession,
+  resolveGrokBuildHome,
+  type GrokBuildSourceSession,
+} from "./grok-build-source.ts";
+import { grokBuildSessionToIr } from "./grok-build-to-ir.ts";
 import type { BridgeBundle, BridgeEvent } from "./ir.ts";
 import { codexRolloutToBridgeBundle, codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
 import { deriveSessionIdFromFilename, loadDesktopSessions, parseRollout } from "./codex-source.ts";
@@ -243,9 +259,13 @@ export interface MatrixCliTargetPlanFile {
 export type MatrixReversePlanFile = MatrixReversePlanFileV4 | MatrixReversePlanFileV5;
 
 export type ClaudeSourceKind = "claude-desktop" | "claude-code";
+export type OneWaySourceKind = "dsh" | "grok-build";
+export type MatrixSourceKind = ClaudeSourceKind | OneWaySourceKind;
+export type OneWayDirection = "dsh-to-codex" | "grok-build-to-codex";
 export type ClaudeImportSession =
   | (ClaudeDesktopSourceSession & { sourceKind: "claude-desktop" })
   | ClaudeCodeSourceSession;
+export type MatrixImportSession = ClaudeImportSession | DshSourceSession | GrokBuildSourceSession;
 
 export interface TitleTransformPolicy {
   prefix: string;
@@ -309,12 +329,27 @@ export interface MatrixForwardPlanFile {
   target: MatrixForwardTargetBinding;
 }
 
-export type MatrixPlanFile = MatrixReversePlanFile | MatrixCliTargetPlanFile | MatrixForwardPlanFile;
+export interface MatrixOneWayCliPlanFile {
+  schema: "agentryx.import-plan/v7";
+  direction: OneWayDirection;
+  sourceKind: OneWaySourceKind;
+  targetKind: "codex-cli";
+  renderMode: RenderMode;
+  goalMode: "skip";
+  titlePolicy: TitleTransformPolicy | null;
+  activeContextPolicy: ActiveContextPolicy | null;
+  allowWrapperCwdRelocation: boolean;
+  digest: string;
+  plan: ImportPlan;
+  target: Omit<MatrixCliTargetBinding, "claudeHome"> & { sourceHome: string };
+}
+
+export type MatrixPlanFile = MatrixReversePlanFile | MatrixCliTargetPlanFile | MatrixOneWayCliPlanFile | MatrixForwardPlanFile;
 export type MatrixDirection = MatrixPlanFile["direction"];
 export type CodexTargetKind = "codex-desktop" | "codex-cli";
 
 export interface LoadedSource {
-  session: ClaudeImportSession;
+  session: MatrixImportSession;
   bundle: BridgeBundle | null;
   summary: ImportPlanSessionSummary;
 }
@@ -598,11 +633,17 @@ export function selectionOptions(argv: string[]): SelectionOptions {
 
 export function matrixDirection(argv: string[]): MatrixDirection {
   const value = option(argv, "--direction");
-  if (value == null) return "claude-to-codex";
-  if (value !== "claude-to-codex" && value !== "codex-to-claude") {
-    throw new Error("--direction must be claude-to-codex or codex-to-claude");
+  if (value == null) {
+    const source = matrixSourceKindOption(argv, { inferClaudeDefault: false });
+    if (source === "dsh") return "dsh-to-codex";
+    if (source === "grok-build") return "grok-build-to-codex";
+    return "claude-to-codex";
   }
-  return value;
+  if (value === "dsh-to-codex" || value === "grok-build-to-codex" ||
+    value === "claude-to-codex" || value === "codex-to-claude") {
+    return value;
+  }
+  throw new Error("--direction must be claude-to-codex, codex-to-claude, dsh-to-codex, or grok-build-to-codex");
 }
 
 export function claudeSourceKindOption(argv: string[]): ClaudeSourceKind {
@@ -612,11 +653,64 @@ export function claudeSourceKindOption(argv: string[]): ClaudeSourceKind {
   throw new Error("--claude-source must be desktop or code");
 }
 
-export function codexTargetKindOption(argv: string[]): CodexTargetKind {
+export function matrixSourceKindOption(
+  argv: string[],
+  options: { inferClaudeDefault?: boolean } = {},
+): MatrixSourceKind | undefined {
+  const inferClaudeDefault = options.inferClaudeDefault ?? true;
+  const value = option(argv, "--source");
+  const claude = option(argv, "--claude-source");
+  const direction = option(argv, "--direction");
+  const normalized = value === "deepseek-harness" ? "dsh" :
+    value === "grokbuild" ? "grok-build" :
+    value === "desktop" || value === "claude" ? "claude-desktop" :
+    value === "code" ? "claude-code" :
+    value;
+  if (normalized === "dsh" || normalized === "grok-build") {
+    if (claude != null) throw new Error("--source dsh|grok-build cannot be combined with --claude-source");
+    return normalized;
+  }
+  if (direction === "dsh-to-codex") {
+    if (normalized != null && normalized !== "dsh") {
+      throw new Error("--direction dsh-to-codex requires --source dsh");
+    }
+    if (claude != null) throw new Error("--direction dsh-to-codex cannot be combined with --claude-source");
+    return "dsh";
+  }
+  if (direction === "grok-build-to-codex") {
+    if (normalized != null && normalized !== "grok-build") {
+      throw new Error("--direction grok-build-to-codex requires --source grok-build");
+    }
+    if (claude != null) throw new Error("--direction grok-build-to-codex cannot be combined with --claude-source");
+    return "grok-build";
+  }
+  if (normalized === "claude-desktop" || normalized === "claude-code") {
+    if (claude != null) {
+      const fromClaude = claudeSourceKindOption(argv);
+      if (fromClaude !== normalized) {
+        throw new Error("--source and --claude-source name different Claude sources");
+      }
+    }
+    return normalized;
+  }
+  if (normalized != null) {
+    throw new Error("--source must be dsh, grok-build, claude-desktop, or claude-code");
+  }
+  if (!inferClaudeDefault && claude == null) return undefined;
+  return claudeSourceKindOption(argv);
+}
+
+export function requireMatrixSourceKind(argv: string[]): MatrixSourceKind {
+  return matrixSourceKindOption(argv) ?? "claude-desktop";
+}
+
+export function codexTargetKindOption(argv: string[], sourceKind?: MatrixSourceKind): CodexTargetKind {
   const value = option(argv, "--codex-target");
-  if (value == null || value === "desktop") return "codex-desktop";
   if (value === "cli") return "codex-cli";
-  throw new Error("--codex-target must be desktop or cli");
+  if (value === "desktop") return "codex-desktop";
+  if (value != null) throw new Error("--codex-target must be desktop or cli");
+  if (sourceKind === "dsh" || sourceKind === "grok-build") return "codex-cli";
+  return "codex-desktop";
 }
 
 export function titleTransformPolicyOption(argv: string[]): TitleTransformPolicy | null {
@@ -731,14 +825,19 @@ export function wrapperCwdRelocationAllowed(identityError: string | null, allow:
   return allow && identityError === "wrapper cwd does not match transcript cwd";
 }
 
-function lossObservations(events: BridgeEvent[]): Array<{ kind: string; count: number; detail?: string }> {
+function lossObservations(
+  events: BridgeEvent[],
+  sourceKind: MatrixSourceKind = "claude-desktop",
+): Array<{ kind: string; count: number; detail?: string }> {
   const counts = new Map<string, number>();
   const add = (kind: string): void => {
     counts.set(kind, (counts.get(kind) ?? 0) + 1);
   };
   let compactBoundaries = 0;
   const resultCounts = new Map<string, number>();
-  const nativeToolIds = nativeToolUseIds(events);
+  const nativeToolIds = sourceKind === "dsh" || sourceKind === "grok-build"
+    ? portableToolUseIds(events)
+    : nativeToolUseIds(events);
   for (const event of events) {
     if (event.kind === "tool_result" && event.toolUseId) {
       resultCounts.set(event.toolUseId, (resultCounts.get(event.toolUseId) ?? 0) + 1);
@@ -868,17 +967,184 @@ export function nativeToolUseIds(events: BridgeEvent[]): Set<string> {
   return valid;
 }
 
+/** Pair tool calls and results by id when the source is not Claude's record-adjacency protocol. */
+export function portableToolUseIds(events: BridgeEvent[]): Set<string> {
+  const calls = new Map<string, Extract<BridgeEvent, { kind: "tool_use" }>>();
+  const results = new Map<string, Extract<BridgeEvent, { kind: "tool_result" }>>();
+  const duplicates = new Set<string>();
+  for (const event of events) {
+    if (event.kind === "tool_use" && event.toolUseId && event.toolUseId.trim() !== "") {
+      if (calls.has(event.toolUseId)) duplicates.add(event.toolUseId);
+      else calls.set(event.toolUseId, event);
+    } else if (event.kind === "tool_result" && event.toolUseId && event.toolUseId.trim() !== "") {
+      if (results.has(event.toolUseId)) duplicates.add(event.toolUseId);
+      else results.set(event.toolUseId, event);
+    }
+  }
+  const valid = new Set<string>();
+  for (const [callId, call] of calls) {
+    if (duplicates.has(callId)) continue;
+    const result = results.get(callId);
+    if (!result) continue;
+    if (call.name == null || call.name.trim() === "") continue;
+    if (call.input == null || typeof call.input !== "object" || Array.isArray(call.input)) continue;
+    valid.add(callId);
+  }
+  return valid;
+}
+
+function oneWaySourceRoot(argv: string[], sourceKind: OneWaySourceKind): string {
+  if (sourceKind === "dsh") {
+    const session = option(argv, "--dsh-session");
+    if (session) return path.resolve(session);
+    return resolveDshHome(option(argv, "--dsh-home"));
+  }
+  const session = option(argv, "--grok-build-session");
+  if (session) return path.resolve(session);
+  return resolveGrokBuildHome(option(argv, "--grok-build-home"));
+}
+
+function loadOneWaySources(
+  argv: string[], selection: SelectionOptions,
+  sourceKind: OneWaySourceKind, targetKind: CodexTargetKind,
+): {
+  sources: LoadedSource[];
+  sourceRoot: string;
+  sourceKind: OneWaySourceKind;
+  unreadable: string[];
+  inventory: MatrixImportSession[];
+} {
+  if (targetKind !== "codex-cli") {
+    throw new Error("DSH and Grok Build imports currently support --codex-target cli only");
+  }
+  if (selection.projectScope === "existing-targets") {
+    throw new Error("--project-scope existing-targets applies only to Codex Desktop targets");
+  }
+  if (option(argv, "--workspace-dir") != null) {
+    throw new Error("--workspace-dir applies only to Claude Desktop sources");
+  }
+  if (flag(argv, "--allow-wrapper-cwd-relocation")) {
+    throw new Error("--allow-wrapper-cwd-relocation applies only to Claude Desktop sources");
+  }
+  const sourceRoot = oneWaySourceRoot(argv, sourceKind);
+  const inventoryResult = sourceKind === "dsh" ? inventoryDsh(sourceRoot) : inventoryGrokBuild(sourceRoot);
+  const inventory = inventoryResult.sessions;
+  const unreadable = inventoryResult.unreadableRecords;
+  const membershipProvenance = sourceKind === "dsh" ? "dsh-session-header-cwd" : "grok-build-summary-cwd";
+  const targets = new Map(inventory.map((session) => [
+    session.sessionId,
+    { exists: null as boolean | null, provenance: "codex-cli-has-no-project-registry", name: undefined as string | undefined },
+  ]));
+  const selectionSessions: SelectionSession[] = inventory.map((session) => {
+    const target = targets.get(session.sessionId)!;
+    return {
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      projectRoot: session.cwd,
+      projectName: target.name,
+      hasProject: session.cwd !== "",
+      archiveState: session.archiveState,
+      archiveProvenance: session.archiveProvenance,
+      projectMembership: session.cwd === "" ? "projectless" : "project",
+      projectMembershipProvenance: membershipProvenance,
+      targetProjectExists: target.exists,
+      firstTsMs: session.createdAtMs,
+      lastTsMs: session.lastActivityAtMs,
+    };
+  });
+  assertSelectorsResolve(selectionSessions, selection);
+  const selectedIds = new Set(selectSessions(selectionSessions, selection).map((session) => session.sessionId));
+  const sources: LoadedSource[] = inventory.filter((session) => selectedIds.has(session.sessionId)).map((session) => {
+    const target = targets.get(session.sessionId)!;
+    const commonSummary = {
+      sessionId: session.sessionId,
+      cwd: session.cwd,
+      projectRoot: session.cwd,
+      projectName: target.name,
+      hasProject: session.cwd !== "",
+      archiveState: session.archiveState,
+      archiveProvenance: session.archiveProvenance,
+      projectMembership: session.cwd === "" ? "projectless" as const : "project" as const,
+      projectMembershipProvenance: membershipProvenance,
+      targetProjectExists: target.exists,
+      firstTsMs: session.createdAtMs,
+      lastTsMs: session.lastActivityAtMs,
+      sourcePath: session.sourcePath,
+    };
+    try {
+      if (session.sourceKind === "dsh") {
+        const log = readDshSessionLog(session.sourcePath);
+        const identityError = dshSessionIdentityError(session, log);
+        if (identityError != null) {
+          return {
+            session,
+            bundle: null,
+            summary: { ...commonSummary, sourceSha256: log.contentSha256, title: session.title, losses: [{ kind: "transcript_identity_mismatch", count: 1, detail: identityError }] },
+          };
+        }
+        const bundle = dshSessionToIr(log);
+        return {
+          session,
+          bundle,
+          summary: {
+            ...commonSummary,
+            sourceSha256: log.contentSha256,
+            title: session.title || log.title || undefined,
+            messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
+            losses: lossObservations(bundle.conversation.events, "dsh"),
+          },
+        };
+      }
+      const pack = readGrokBuildSession(session.sourcePath);
+      const identityError = grokBuildSessionIdentityError(session, pack);
+      if (identityError != null) {
+        return {
+          session,
+          bundle: null,
+          summary: { ...commonSummary, sourceSha256: pack.contentSha256, title: session.title, losses: [{ kind: "transcript_identity_mismatch", count: 1, detail: identityError }] },
+        };
+      }
+      const bundle = grokBuildSessionToIr(pack);
+      return {
+        session,
+        bundle,
+        summary: {
+          ...commonSummary,
+          sourceSha256: pack.contentSha256,
+          title: session.title || pack.title || undefined,
+          messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
+          losses: lossObservations(bundle.conversation.events, "grok-build"),
+        },
+      };
+    } catch (error) {
+      return {
+        session,
+        bundle: null,
+        summary: {
+          ...commonSummary,
+          title: session.title,
+          losses: [{ kind: "transcript_unavailable", count: 1, detail: error instanceof Error ? error.message : String(error) }],
+        },
+      };
+    }
+  });
+  return { sources, sourceRoot: inventoryResult.sourceRoot, sourceKind, unreadable, inventory };
+}
+
 function loadSources(
   argv: string[], selection: SelectionOptions, allowWrapperCwdRelocation = false,
-  sourceKind: ClaudeSourceKind = "claude-desktop",
+  sourceKind: MatrixSourceKind = "claude-desktop",
   targetKind: CodexTargetKind = "codex-desktop",
 ): {
   sources: LoadedSource[];
   sourceRoot: string;
-  sourceKind: ClaudeSourceKind;
+  sourceKind: MatrixSourceKind;
   unreadable: string[];
-  inventory: ClaudeImportSession[];
+  inventory: MatrixImportSession[];
 } {
+  if (sourceKind === "dsh" || sourceKind === "grok-build") {
+    return loadOneWaySources(argv, selection, sourceKind, targetKind);
+  }
   if (targetKind === "codex-cli" && selection.projectScope === "existing-targets") {
     throw new Error("--project-scope existing-targets applies only to Codex Desktop targets");
   }
@@ -1053,6 +1319,17 @@ function exactSourceText(source: LoadedSource): string {
   return source.bundle.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join("");
 }
 
+function sourceFormatLabel(sourceKind: MatrixImportSession["sourceKind"]): string {
+  if (sourceKind === "dsh") return "DeepSeek Harness";
+  if (sourceKind === "grok-build") return "Grok Build";
+  return "Claude JSONL";
+}
+
+function defaultImportedTitle(sourceKind: MatrixImportSession["sourceKind"], verbatim: boolean): string {
+  const label = sourceFormatLabel(sourceKind);
+  return verbatim ? `Imported ${label} conversation (verbatim)` : `Imported ${label} conversation`;
+}
+
 export function bridgeToLogical(
   source: LoadedSource,
   renderMode: RenderMode,
@@ -1064,11 +1341,11 @@ export function bridgeToLogical(
     const createdAt = createdAtMs != null && Number.isFinite(createdAtMs)
       ? new Date(createdAtMs).toISOString()
       : new Date(0).toISOString();
-    const literal = `${inertHistoricalNotice("Claude JSONL")}\n\n${exactSourceText(source)}`;
+    const literal = `${inertHistoricalNotice(sourceFormatLabel(source.session.sourceKind))}\n\n${exactSourceText(source)}`;
     const logical = {
       cwd: canonicalProjectIdentity(source.session.cwd || os.homedir()).path,
       title: transformTitle(
-        source.session.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
+        source.session.title || source.bundle.conversation.title || defaultImportedTitle(source.session.sourceKind, true),
         titlePolicy,
       ),
       createdAt,
@@ -1084,7 +1361,9 @@ export function bridgeToLogical(
   let compaction: LogicalCodexConversation["compaction"];
   let pendingSummary: string | undefined;
   const resultCounts = new Map<string, number>();
-  const nativeToolIds = nativeToolUseIds(events);
+  const nativeToolIds = source.session.sourceKind === "dsh" || source.session.sourceKind === "grok-build"
+    ? portableToolUseIds(events)
+    : nativeToolUseIds(events);
   for (const event of events) {
     if (event.kind === "tool_result" && event.toolUseId) resultCounts.set(event.toolUseId, (resultCounts.get(event.toolUseId) ?? 0) + 1);
   }
@@ -1174,7 +1453,7 @@ export function bridgeToLogical(
   }
   if (compaction != null && (compaction.summary == null || compaction.summary.trim() === "")) {
     throw new Error(
-      `Claude compact boundary has no recoverable replacement summary: ${source.session.sessionId}`,
+      `${sourceFormatLabel(source.session.sourceKind)} compact boundary has no recoverable replacement summary: ${source.session.sessionId}`,
     );
   }
   let earliest = Number.POSITIVE_INFINITY;
@@ -1187,7 +1466,7 @@ export function bridgeToLogical(
   const logical = {
     cwd: canonicalProjectIdentity(source.session.cwd || os.homedir()).path,
     title: transformTitle(
-      source.session.title || source.bundle.conversation.title || "Imported Claude conversation",
+      source.session.title || source.bundle.conversation.title || defaultImportedTitle(source.session.sourceKind, false),
       titlePolicy,
     ),
     createdAt: Number.isNaN(createdAt.getTime()) ? new Date(0).toISOString() : createdAt.toISOString(),
@@ -1243,6 +1522,7 @@ export function compactLogicalForTarget(
 export function matrixPlanDigest(
   value: Omit<MatrixReversePlanFile, "digest"> |
     Omit<MatrixCliTargetPlanFile, "digest"> |
+    Omit<MatrixOneWayCliPlanFile, "digest"> |
     Omit<MatrixForwardPlanFile, "digest">,
 ): string {
   assertCurrentImportPlan(value.plan);
@@ -1606,9 +1886,13 @@ export function buildForwardMatrixPlan(
 }
 
 function targetSummary(source: LoadedSource, plan: CodexTargetPlan): MatrixTargetSessionPlan {
+  const session = source.session;
+  if (session.sourceKind !== "claude-desktop" && session.sourceKind !== "claude-code") {
+    throw new Error("Codex Desktop target summaries are only produced for Claude sources");
+  }
   return {
-    sourceWrapperSessionId: source.session.wrapperSessionId,
-    sourceCliSessionId: source.session.cliSessionId!,
+    sourceWrapperSessionId: session.sourceKind === "claude-desktop" ? session.wrapperSessionId : null,
+    sourceCliSessionId: session.cliSessionId ?? session.sessionId,
     operationId: plan.operationId,
     targetThreadId: plan.threadId,
     rolloutPath: canonicalExistingPath(plan.rolloutPath),
@@ -1870,12 +2154,16 @@ function buildMatrixPlan(
   return { file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) } as MatrixReversePlanFile, targetPlans };
 }
 
+function isOneWaySourceKind(sourceKind: MatrixSourceKind): sourceKind is OneWaySourceKind {
+  return sourceKind === "dsh" || sourceKind === "grok-build";
+}
+
 function buildCodexCliMatrixPlan(
   sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode,
   titlePolicy: TitleTransformPolicy | null, activeContextPolicy: ActiveContextPolicy | null,
-  allowWrapperCwdRelocation: boolean, sourceKind: ClaudeSourceKind,
-  runtime: CodexCliRuntime, codexHome: string, claudeHome: string, bridgeRoot: string,
-): { file: MatrixCliTargetPlanFile; targetPlans: CodexCliTargetPlan[] } {
+  allowWrapperCwdRelocation: boolean, sourceKind: MatrixSourceKind,
+  runtime: CodexCliRuntime, codexHome: string, sourceHome: string, bridgeRoot: string,
+): { file: MatrixCliTargetPlanFile | MatrixOneWayCliPlanFile; targetPlans: CodexCliTargetPlan[] } {
   if (selection.projectScope === "existing-targets") {
     throw new Error("--project-scope existing-targets applies only to Codex Desktop targets");
   }
@@ -1894,7 +2182,11 @@ function buildCodexCliMatrixPlan(
     ...(summary.archiveState === "unknown" ? [{
       kind: "source_archive_state_unknown",
       count: 1,
-      detail: "Claude Code has no Desktop wrapper archive flag; the imported Codex CLI rollout will be active.",
+      detail: sourceKind === "dsh"
+        ? "DeepSeek Harness session logs have no archive flag; the imported Codex CLI rollout will be active."
+        : sourceKind === "grok-build"
+          ? "Grok Build packages have no archive flag; the imported Codex CLI rollout will be active."
+          : "Claude Code has no Desktop wrapper archive flag; the imported Codex CLI rollout will be active.",
     }] : []),
       ...(sourceArchived ? [{
         kind: "target_archive_not_supported",
@@ -1931,6 +2223,42 @@ function buildCodexCliMatrixPlan(
     selected.targetConversationExists = state !== "absent";
     selected.targetConversationState = state === "already-applied" ? "exact-existing" : state;
   }
+  const cliTargetCore = {
+    codexHome: path.resolve(codexHome),
+    bridgeRoot: path.resolve(bridgeRoot),
+    cliVersion: runtime.version,
+    modelProvider: runtime.modelProvider,
+    cliExecutablePath: runtime.executablePath,
+    cliExecutableSha256: runtime.executableSha256,
+    rendererId: CODEX_CLI_RENDERER_ID,
+    sessions: targetPlans.map((target, index) => ({
+      sourceSessionId: built.plan.sessions[index]!.sessionId,
+      operationId: target.operationId,
+      targetThreadId: target.targetThreadId,
+      rolloutPath: target.rolloutPath,
+      rolloutSha256: target.rolloutSha256,
+      rolloutBytes: target.rolloutBytes,
+    })),
+  };
+  if (isOneWaySourceKind(sourceKind)) {
+    const withoutDigest: Omit<MatrixOneWayCliPlanFile, "digest"> = {
+      schema: "agentryx.import-plan/v7",
+      direction: sourceKind === "dsh" ? "dsh-to-codex" : "grok-build-to-codex",
+      sourceKind,
+      targetKind: "codex-cli",
+      renderMode,
+      goalMode: "skip",
+      titlePolicy,
+      activeContextPolicy,
+      allowWrapperCwdRelocation,
+      plan: built.plan,
+      target: { ...cliTargetCore, sourceHome: path.resolve(sourceHome) },
+    };
+    return {
+      file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) },
+      targetPlans,
+    };
+  }
   const withoutDigest: Omit<MatrixCliTargetPlanFile, "digest"> = {
     schema: "agentryx.import-plan/v6",
     direction: "claude-to-codex",
@@ -1942,24 +2270,7 @@ function buildCodexCliMatrixPlan(
     activeContextPolicy,
     allowWrapperCwdRelocation,
     plan: built.plan,
-    target: {
-      codexHome: path.resolve(codexHome),
-      claudeHome: path.resolve(claudeHome),
-      bridgeRoot: path.resolve(bridgeRoot),
-      cliVersion: runtime.version,
-      modelProvider: runtime.modelProvider,
-      cliExecutablePath: runtime.executablePath,
-      cliExecutableSha256: runtime.executableSha256,
-      rendererId: CODEX_CLI_RENDERER_ID,
-      sessions: targetPlans.map((target, index) => ({
-        sourceSessionId: built.plan.sessions[index]!.sessionId,
-        operationId: target.operationId,
-        targetThreadId: target.targetThreadId,
-        rolloutPath: target.rolloutPath,
-        rolloutSha256: target.rolloutSha256,
-        rolloutBytes: target.rolloutBytes,
-      })),
-    },
+    target: { ...cliTargetCore, claudeHome: path.resolve(sourceHome) },
   };
   return {
     file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) },
@@ -1999,14 +2310,17 @@ function assertJsonOutputWritable(target: string | undefined): void {
 
 export const MATRIX_HELP =
   "usage: threadpass <scan|plan|apply|recover> [--archive active|archived|all] " +
-  "[--claude-source desktop|code] [--codex-target desktop|cli] " +
+  "[--source dsh|grok-build|claude-desktop|claude-code] [--claude-source desktop|code] " +
+  "[--codex-target desktop|cli] " +
+  "[--dsh-home PATH] [--dsh-session PATH] [--grok-build-home PATH] [--grok-build-session PATH] " +
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
   "[--render-mode semantic|verbatim] [--goal-mode migrate|skip] [--no-migrate-goal] " +
   "[--title-prefix TEXT] [--replace-title-prefix TEXT] " +
   "[--compact-active-bytes N] [--allow-wrapper-cwd-relocation] " +
   "[--codex-cli-bin PATH] [--codex-cli-model-provider ID] " +
-  "[--direction claude-to-codex|codex-to-claude] [--allow-overwrite] [--dry-run]\n";
+  "[--direction claude-to-codex|codex-to-claude|dsh-to-codex|grok-build-to-codex] " +
+  "[--allow-overwrite] [--dry-run]\n";
 
 function forwardWorkspace(argv: string[], claudeHome: string): string | null {
   if (flag(argv, "--no-register")) return null;
@@ -2213,6 +2527,160 @@ function applyCodexCliMatrixPlan(
   });
 }
 
+function applyOneWayCliMatrixPlan(argv: string[], stored: MatrixOneWayCliPlanFile): void {
+  const confirmation = option(argv, "--confirm");
+  if (!confirmation) throw new Error("Codex CLI apply requires --confirm <plan digest>");
+  if (stored.schema !== "agentryx.import-plan/v7" || stored.targetKind !== "codex-cli" ||
+    (stored.direction !== "dsh-to-codex" && stored.direction !== "grok-build-to-codex") ||
+    (stored.sourceKind !== "dsh" && stored.sourceKind !== "grok-build") ||
+    stored.target.rendererId !== CODEX_CLI_RENDERER_ID || stored.goalMode !== "skip") {
+    throw new Error("unsupported Codex CLI import plan");
+  }
+  assertCurrentImportPlan(stored.plan);
+  const { digest, ...content } = stored;
+  if (matrixPlanDigest(content) !== digest) throw new Error("stored import plan content does not match its digest");
+  if (confirmation !== digest) throw new Error("confirmation digest does not match the plan");
+  if (option(argv, "--direction") != null && matrixDirection(argv) !== stored.direction) {
+    throw new Error("apply direction differs from the confirmed plan");
+  }
+  if (option(argv, "--source") != null && requireMatrixSourceKind(argv) !== stored.sourceKind) {
+    throw new Error("apply source differs from the confirmed plan");
+  }
+  if (option(argv, "--codex-target") != null && codexTargetKindOption(argv, stored.sourceKind) !== stored.targetKind) {
+    throw new Error("apply Codex target differs from the confirmed plan");
+  }
+  const requestedCodexHome = option(argv, "--codex-home");
+  if (requestedCodexHome != null && path.resolve(requestedCodexHome) !== path.resolve(stored.target.codexHome)) {
+    throw new Error("apply Codex home differs from the confirmed plan");
+  }
+  const sourceHomeFlag = stored.sourceKind === "dsh" ? "--dsh-home" : "--grok-build-home";
+  const sourceSessionFlag = stored.sourceKind === "dsh" ? "--dsh-session" : "--grok-build-session";
+  const requestedSourceHome = option(argv, sourceHomeFlag);
+  const requestedSourceSession = option(argv, sourceSessionFlag);
+  if (requestedSourceHome != null && path.resolve(requestedSourceHome) !== path.resolve(stored.target.sourceHome) &&
+    requestedSourceSession == null) {
+    throw new Error("apply source home differs from the confirmed plan");
+  }
+  const requestedMode = option(argv, "--render-mode");
+  if (requestedMode != null && parseRenderMode(requestedMode) !== stored.renderMode) {
+    throw new Error("apply render mode differs from the confirmed plan");
+  }
+  const goalExplicit = optionValues(argv, "--goal-mode").length > 0 || flag(argv, "--no-migrate-goal");
+  if (goalExplicit && goalMigrationModeOption(argv) !== "skip") {
+    throw new Error("Codex CLI targets cannot activate live Goals; use --goal-mode skip");
+  }
+  const requestedTitlePolicy = titleTransformPolicyOption(argv);
+  if ((option(argv, "--title-prefix") != null || optionValues(argv, "--replace-title-prefix").length > 0) &&
+    canonicalStringify(requestedTitlePolicy) !== canonicalStringify(stored.titlePolicy)) {
+    throw new Error("apply title transform policy differs from the confirmed plan");
+  }
+  const requestedActiveContextPolicy = activeContextPolicyOption(argv);
+  if (option(argv, "--compact-active-bytes") != null &&
+    canonicalStringify(requestedActiveContextPolicy) !== canonicalStringify(stored.activeContextPolicy)) {
+    throw new Error("apply active context policy differs from the confirmed plan");
+  }
+  if (flag(argv, "--allow-wrapper-cwd-relocation")) {
+    throw new Error("--allow-wrapper-cwd-relocation applies only to Claude Desktop sources");
+  }
+  if (option(argv, "--workspace-dir") != null) {
+    throw new Error("--workspace-dir applies only to Claude Desktop source selection");
+  }
+  if (option(argv, "--evidence") != null) {
+    throw new Error("--evidence applies only to Codex Desktop targets");
+  }
+  if (flag(argv, "--allow-overwrite")) {
+    throw new Error("Codex CLI target never overwrites an existing rollout");
+  }
+  const codexHome = path.resolve(stored.target.codexHome);
+  const runtime = detectCodexCliRuntime(codexHome, {
+    executable: option(argv, "--codex-cli-bin"),
+    modelProvider: option(argv, "--codex-cli-model-provider"),
+  });
+  const sourceArgv = [
+    ...argv,
+    ...(requestedCodexHome == null ? ["--codex-home", stored.target.codexHome] : []),
+    ...(requestedSourceHome == null && requestedSourceSession == null
+      ? [sourceHomeFlag, stored.target.sourceHome] : []),
+  ];
+  const loaded = loadSources(
+    sourceArgv,
+    selectionFromPlan(stored.plan),
+    false,
+    stored.sourceKind,
+    "codex-cli",
+  );
+  const requestedBridgeRoot = option(argv, "--bridge-root");
+  if (requestedBridgeRoot != null && path.resolve(requestedBridgeRoot) !== path.resolve(stored.target.bridgeRoot)) {
+    throw new Error("apply bridge root differs from the confirmed plan");
+  }
+  const rebuilt = buildCodexCliMatrixPlan(
+    loaded.sources,
+    selectionFromPlan(stored.plan),
+    stored.renderMode,
+    stored.titlePolicy,
+    stored.activeContextPolicy,
+    stored.allowWrapperCwdRelocation,
+    stored.sourceKind,
+    runtime,
+    codexHome,
+    stored.target.sourceHome,
+    stored.target.bridgeRoot,
+  );
+  if (rebuilt.file.digest !== stored.digest) {
+    throw new Error("source inventory, Codex CLI version/provider, renderer, or target binding changed after planning");
+  }
+  if (flag(argv, "--dry-run")) {
+    if (option(argv, "--out") != null) throw new Error("--dry-run refuses --out because it is zero-mutation");
+    const states = rebuilt.targetPlans.map(inspectCodexCliTarget);
+    const blockers = states.flatMap((state, index) => state === "collision"
+      ? [`${rebuilt.targetPlans[index]!.targetThreadId}: target rollout collision`] : []);
+    process.stdout.write(`${JSON.stringify({
+      dryRun: true,
+      digest: stored.digest,
+      target: "codex-cli",
+      sourceKind: stored.sourceKind,
+      direction: stored.direction,
+      cliVersion: runtime.version,
+      modelProvider: runtime.modelProvider,
+      cliExecutablePath: runtime.executablePath,
+      cliExecutableSha256: runtime.executableSha256,
+      writeReadiness: blockers.length === 0 ? "ready" : "blocked",
+      blockers,
+      sessions: rebuilt.targetPlans.map((plan, index) => ({
+        sessionId: stored.plan.sessions[index]!.sessionId,
+        threadId: plan.targetThreadId,
+        rolloutPath: plan.rolloutPath,
+        rolloutBytes: plan.rolloutBytes,
+        state: states[index],
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
+  const states = rebuilt.targetPlans.map(inspectCodexCliTarget);
+  const collisions = states.flatMap((state, index) => state === "collision"
+    ? [rebuilt.targetPlans[index]!.rolloutPath] : []);
+  if (collisions.length > 0) throw new Error(`Codex CLI target collision(s): ${collisions.join(", ")}`);
+  assertJsonOutputWritable(option(argv, "--out"));
+  for (const selected of stored.plan.sessions) {
+    const source = loaded.sources.find((candidate) => candidate.session.sessionId === selected.sessionId);
+    if (!source?.bundle) throw new Error(`source is unavailable: ${selected.sessionId}`);
+    writeBridgeConversation(stored.target.bridgeRoot, source.bundle);
+  }
+  const results = rebuilt.targetPlans.map((plan) => applyCodexCliTarget(plan));
+  writeJson(option(argv, "--out"), {
+    direction: stored.direction,
+    sourceKind: stored.sourceKind,
+    targetKind: stored.targetKind,
+    digest: stored.digest,
+    applied: results.filter((result) => result === "applied").length,
+    alreadyApplied: results.filter((result) => result === "already-applied").length,
+    sessions: rebuilt.targetPlans.map((plan) => ({
+      threadId: plan.targetThreadId,
+      rolloutPath: plan.rolloutPath,
+    })),
+  });
+}
+
 export function main(argv = process.argv.slice(2)): void {
   const command = argv[0];
   if (!command) throw new Error(MATRIX_HELP.trimEnd());
@@ -2225,8 +2693,9 @@ export function main(argv = process.argv.slice(2)): void {
     if (selection.archive == null) selection.archive = "all";
     const direction = matrixDirection(argv);
     if (direction === "codex-to-claude") {
-      if (option(argv, "--claude-source") != null || option(argv, "--codex-target") != null) {
-        throw new Error("--claude-source and --codex-target apply only to Claude-to-Codex operations");
+      if (option(argv, "--claude-source") != null || option(argv, "--codex-target") != null ||
+        option(argv, "--source") != null) {
+        throw new Error("--source, --claude-source, and --codex-target apply only to imports into Codex");
       }
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
       const inventory = loadForwardCodexInventory(codexHome);
@@ -2262,8 +2731,8 @@ export function main(argv = process.argv.slice(2)): void {
       return;
     }
     const allowWrapperCwdRelocation = flag(argv, "--allow-wrapper-cwd-relocation");
-    const sourceKind = claudeSourceKindOption(argv);
-    const targetKind = codexTargetKindOption(argv);
+    const sourceKind = requireMatrixSourceKind(argv);
+    const targetKind = codexTargetKindOption(argv, sourceKind);
     const loaded = loadSources(argv, selection, allowWrapperCwdRelocation, sourceKind, targetKind);
     const renderMode = parseRenderMode(option(argv, "--render-mode"));
     const goalMode = goalMigrationModeOption(argv);
@@ -2298,8 +2767,9 @@ export function main(argv = process.argv.slice(2)): void {
   if (command === "plan") {
     const direction = matrixDirection(argv);
     if (direction === "codex-to-claude") {
-      if (option(argv, "--claude-source") != null || option(argv, "--codex-target") != null) {
-        throw new Error("--claude-source and --codex-target apply only to Claude-to-Codex operations");
+      if (option(argv, "--claude-source") != null || option(argv, "--codex-target") != null ||
+        option(argv, "--source") != null) {
+        throw new Error("--source, --claude-source, and --codex-target apply only to imports into Codex");
       }
       const selection = selectionOptions(argv);
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
@@ -2320,8 +2790,8 @@ export function main(argv = process.argv.slice(2)): void {
     }
     const selection = selectionOptions(argv);
     const allowWrapperCwdRelocation = flag(argv, "--allow-wrapper-cwd-relocation");
-    const sourceKind = claudeSourceKindOption(argv);
-    const targetKind = codexTargetKindOption(argv);
+    const sourceKind = requireMatrixSourceKind(argv);
+    const targetKind = codexTargetKindOption(argv, sourceKind);
     const loaded = loadSources(argv, selection, allowWrapperCwdRelocation, sourceKind, targetKind);
     const codexHome = resolveCodexHome(option(argv, "--codex-home"));
     if (targetKind === "codex-cli") {
@@ -2341,13 +2811,19 @@ export function main(argv = process.argv.slice(2)): void {
         modelProvider: option(argv, "--codex-cli-model-provider"),
       });
       const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
+      const sourceHome = isOneWaySourceKind(sourceKind)
+        ? oneWaySourceRoot(argv, sourceKind)
+        : resolveClaudeHome(option(argv, "--claude-home"));
       const matrix = buildCodexCliMatrixPlan(
         loaded.sources, selection, renderMode, titlePolicy, activeContextPolicy,
         allowWrapperCwdRelocation, sourceKind, runtime, codexHome,
-        resolveClaudeHome(option(argv, "--claude-home")), bridgeRoot,
+        sourceHome, bridgeRoot,
       );
       writeJson(option(argv, "--out"), matrix.file);
       return;
+    }
+    if (isOneWaySourceKind(sourceKind)) {
+      throw new Error("DSH and Grok Build imports currently support --codex-target cli only");
     }
     const evidencePath = option(argv, "--evidence");
     if (!evidencePath) throw new Error("plan requires --evidence <41059 snapshot manifest>");
@@ -2421,6 +2897,12 @@ export function main(argv = process.argv.slice(2)): void {
     if (candidate.schema === "agentryx.import-plan/v6" && candidate.direction === "claude-to-codex") {
       assertCurrentImportPlan(candidate.plan);
       applyCodexCliMatrixPlan(argv, candidate as unknown as MatrixCliTargetPlanFile);
+      return;
+    }
+    if (candidate.schema === "agentryx.import-plan/v7" &&
+      (candidate.direction === "dsh-to-codex" || candidate.direction === "grok-build-to-codex")) {
+      assertCurrentImportPlan(candidate.plan);
+      applyOneWayCliMatrixPlan(argv, candidate as unknown as MatrixOneWayCliPlanFile);
       return;
     }
     if (candidate.schema === "agentryx.import-plan/v4" && candidate.direction === "codex-to-claude") {

@@ -114,6 +114,25 @@ plus the configured model provider. It never mutates Desktop SQLite state.
 Existing identical rollouts are idempotent; collisions are refused. It does
 not activate live Goals and imports as an active session.
 
+One-way DeepSeek Harness and Grok Build imports target that same Codex CLI
+path. They are not bidirectional and do not write Claude transcripts:
+
+```bash
+threadpass scan --source dsh --dsh-home ~/.dsh --archive all
+threadpass plan --source dsh --dsh-session path/to/session.v4.jsonl.zstd --archive all --out import-plan.json
+threadpass apply --plan import-plan.json --confirm <digest>
+
+threadpass scan --source grok-build --grok-build-session <session-dir> --archive all
+threadpass plan --source grok-build --grok-build-home ~/.grok --archive all --out import-plan.json
+```
+
+`--dsh-home` defaults to `$DSH_HOME` or `~/.dsh`; `--grok-build-home` defaults
+to `$GROK_HOME`, `$GROK_BUILD_HOME`, or `~/.grok`. A Grok Build session directory
+must contain `summary.json` and `updates.jsonl`. These sources have no archive
+flag, so planning requires `--archive all`. The resulting v7 plan binds
+`sourceKind` and writes a new active Codex CLI rollout. `--codex-target desktop`
+is not supported for these sources in this release.
+
 Semantic Claude history is only made resumable when its compact summary can be
 recovered into a nonempty Codex `replacement_history`; otherwise planning fails
 closed. Verbatim mode instead keeps compact records as inert archival context
